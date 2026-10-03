@@ -8,7 +8,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 
 ## Current step
 
-👉 **Step 6.0 — B+Tree review follow-ups**
+👉 **Step 6.1 — Transaction manager** (design doc `13-transactions.md` awaiting review)
 
 ---
 
@@ -16,7 +16,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 
 | Date | Step | Result | Notes |
 |---|---|---|---|
-| — | — | — | — |
+| 2026-10-03 | 6.0 B+Tree review follow-ups | ✅ Done | Every item was already done by B+Tree design revision 2 (commits `d1f85dd`, `5b5e6d3`): leaf cell `Flags` byte with data format version 2; deferred frees logged (WAL type 6), re-logged by checkpoints and replayed by recovery, with crash tests; the deadlock-freedom argument in `08-btree.md` section 2.9 corrected and `TestConcurrentLeftSiblingRepairs` added; full-page images (problem #8 stays open) and root X-latching in the Limitations. Checked again against the code and docs; nothing left to do. |
 
 ---
 
@@ -67,7 +67,7 @@ flowchart TB
 
 ---
 
-### 👉 Step 6.0 — B+Tree review follow-ups
+### ✅ Step 6.0 — B+Tree review follow-ups
 
 **Goal:** Close the gaps found in the B+Tree design review before MVCC builds on top of it. *(If any item below is already done, mark it and move on.)*
 
@@ -79,9 +79,11 @@ flowchart TB
 
 **Acceptance:** Design doc updated; all B+Tree tests, fuzz, and crash tests pass with the new cell format; a crash test proves deferred frees are no longer lost.
 
+**Done:** all four items were already delivered by B+Tree design revision 2 (`d1f85dd`, `5b5e6d3`); see the session log.
+
 ---
 
-### ⬜ Step 6.1 — Transaction manager
+### 👉 Step 6.1 — Transaction manager
 
 **Goal:** Group many statements into one all-or-nothing unit.
 
@@ -90,7 +92,7 @@ flowchart TB
 - Transaction states: active, committed, aborted. A transaction status table that answers "did transaction X commit?"
 - `BEGIN`, `COMMIT`, `ROLLBACK` at the engine level; every statement outside `BEGIN` runs in its own autocommit transaction.
 - Commit record in the WAL; `COMMIT` returns only after it is fsynced.
-- Design doc `12-transactions.md`.
+- Design doc `13-transactions.md`.
 
 **Out of scope:** undo, visibility, locking (later steps).
 
@@ -106,7 +108,7 @@ flowchart TB
 - Undo pages and undo segments, allocated per transaction.
 - Undo record format: transaction ID, operation type (insert, update, delete), target row ID, the previous row image (or only the changed columns), and a pointer to the previous undo record for the same row.
 - Every undo write is WAL-logged.
-- Design doc `13-undo-log.md` with byte layouts.
+- Design doc `14-undo-log.md` with byte layouts.
 
 **Acceptance:** Undo records round-trip; a fuzz target for undo record decoding; undo pages survive crashes; model-based tests for undo chains.
 
@@ -121,7 +123,7 @@ flowchart TB
 - `UPDATE` writes the old version to the undo log, then changes the row in place. If the new row no longer fits on its page, move it and leave a forwarding pointer (design doc must explain the trade-offs).
 - `DELETE` marks the row deleted and records undo; the space is reclaimed later by purge.
 - `INSERT` records an undo entry so it can be rolled back.
-- Design doc `14-row-versioning.md`.
+- Design doc `15-row-versioning.md`.
 
 **Acceptance:** Repeated updates of the same row do not grow the table; model-based tests with random insert/update/delete; crash tests pass.
 
@@ -136,7 +138,7 @@ flowchart TB
 - Visibility rule: if the row's version is not visible to the snapshot, walk its undo chain back to the newest visible version.
 - Isolation levels: `READ COMMITTED` (new snapshot per statement, PostgreSQL's default) and `REPEATABLE READ` (one snapshot per transaction).
 - A transaction always sees its own changes.
-- Design doc `15-snapshots-visibility.md`.
+- Design doc `16-snapshots-visibility.md`.
 
 **Acceptance:** Tests for the classic anomalies: no dirty reads; non-repeatable reads prevented under `REPEATABLE READ`; phantom behaviour documented. Concurrent readers and writers under `-race` with a model checker.
 
@@ -165,7 +167,7 @@ flowchart TB
 - `SELECT ... FOR UPDATE`.
 - Lock manager with a wait-for graph and deadlock detection. The error reports exactly which transactions and rows formed the cycle (problem #43).
 - Lock wait timeout setting.
-- Design doc `16-locking.md`.
+- Design doc `17-locking.md`.
 
 **Acceptance:** Concurrency tests for lost updates, waits, timeouts, and deadlocks; deadlock reports are readable and accurate.
 
@@ -180,7 +182,7 @@ flowchart TB
 - Index scans re-check the visible row version against the search key.
 - Unique constraints check against all versions that might still commit, not just visible ones.
 - NULLs in unique indexes behave as in PostgreSQL (multiple NULLs allowed).
-- Design doc update for `08-btree.md` plus `17-mvcc-indexes.md`.
+- Design doc update for `08-btree.md` plus `18-mvcc-indexes.md`.
 
 **Acceptance:** Model-based tests with concurrent snapshots and indexed updates; unique violations raised exactly when PostgreSQL would raise them.
 
@@ -195,7 +197,7 @@ flowchart TB
 - Background purge: discard old undo, remove delete-marked index entries, reclaim space from deleted rows.
 - Purge only touches undo and the specific rows/entries it names. It **never scans whole tables**.
 - Bounded and observable undo retention: report undo size and the oldest transaction holding it back; a configurable limit and warning for long-running transactions (problem #24).
-- Design doc `18-purge.md`.
+- Design doc `19-purge.md`.
 
 **Acceptance:** Under a long random workload with concurrent snapshots, undo size stays bounded, table and index sizes stay flat for update-heavy loads, and no visible version is ever purged too early (model checker).
 
