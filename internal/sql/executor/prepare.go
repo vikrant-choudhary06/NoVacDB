@@ -87,7 +87,7 @@ func (db *DB) Prepare(ctx context.Context, sql string, declared []types.Type) (*
 	}
 	p.stmt = stmts[0]
 	ps := &params{types: p.ParamTypes}
-	r, err := db.run(ctx, sql, p.stmt, ps, true)
+	r, err := db.run(ctx, nil, sql, p.stmt, ps, true)
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +107,10 @@ func (db *DB) Prepare(ctx context.Context, sql string, declared []types.Type) (*
 // error, as clients rely on the description they were given. An empty
 // statement returns a nil Result.
 func (db *DB) ExecPrepared(ctx context.Context, p *Prepared, values []types.Value) (*Result, error) {
+	return db.execPrepared(ctx, nil, p, values)
+}
+
+func (db *DB) execPrepared(ctx context.Context, tx *Tx, p *Prepared, values []types.Value) (*Result, error) {
 	if len(values) != len(p.ParamTypes) {
 		return nil, sqlerr.New(sqlerr.ProtocolViolation, "%d parameter values for a statement with %d parameters", len(values), len(p.ParamTypes))
 	}
@@ -118,7 +122,7 @@ func (db *DB) ExecPrepared(ctx context.Context, p *Prepared, values []types.Valu
 	if p.stmt == nil {
 		return nil, nil
 	}
-	r, err := db.run(ctx, p.sql, p.stmt, &params{types: p.ParamTypes, values: values}, false)
+	r, err := db.run(ctx, tx, p.sql, p.stmt, &params{types: p.ParamTypes, values: values}, false)
 	if err != nil {
 		return nil, err
 	}

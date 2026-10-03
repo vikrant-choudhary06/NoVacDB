@@ -59,6 +59,8 @@ const (
 	DependentObjectsStillExist   = "2BP01"
 	StatementTooComplex          = "54001"
 	ObjectNotInPrerequisiteState = "55000"
+	InvalidTransactionState      = "25000"
+	InFailedSQLTransaction       = "25P02"
 	QueryCanceled                = "57014"
 	AdminShutdown                = "57P01"
 	CannotConnectNow             = "57P03"

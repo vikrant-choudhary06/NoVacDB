@@ -1,6 +1,6 @@
 # 13 — Transactions (`internal/wal`, `internal/sql/executor`)
 
-Status: **Step 6.1 (transaction manager) designed; awaiting review.** Later Phase 6 steps extend this document or have their own (14-undo-log.md through 19-purge.md, see PROGRESS.md).
+Status: **Step 6.1 (transaction manager) designed, approved and implemented** (notes in section 2.8). Later Phase 6 steps extend this document or have their own (14-undo-log.md through 19-purge.md, see PROGRESS.md).
 
 ## 1. Problem
 
@@ -128,9 +128,24 @@ With one writer at a time, a transaction's records are contiguous in the log, as
 
 The end-of-recovery checkpoint records the recovered `NextXID`.
 
-## 3. Formats (approval needed)
+### 2.8 Implementation notes (Step 6.1)
 
-These are the only on-disk changes in Step 6.1. The phase's rules approve a format change only for Step 6.3, so **this one needs the maintainer's approval.**
+- **The status table keeps outcomes for two checkpoint intervals, not one.** A checkpoint forgets the outcomes that ended before the *previous* checkpoint's redo point.
+  - With the one-interval rule of section 2.3, the end-of-recovery checkpoint, whose redo point is the end of the log, would forget everything recovery had just found. A transaction without a commit record would then read "resolved" instead of "aborted".
+  - The table is still bounded, and still rebuilt from the log alone: within one run of the engine it covers the last two checkpoint intervals, and after a restart, the log from the last checkpoint's redo point. An outcome older than that reads "resolved", as section 2.3 allows.
+- **`wal.Unchanged(err)`.** The executor's DDL keeps the catalog's rule that a `*sqlerr.Error` means nothing changed (10-executor.md section 2.4).
+  - A `Write` function returns such an error wrapped in `Unchanged`. The transaction then stays usable, and `Write` returns the error itself.
+  - In autocommit, the statement's transaction then commits, empty, as its statement group did. In an explicit transaction, the executor marks the transaction failed (`25P02`), as PostgreSQL does after any error.
+- **Recovery's first pass checks every record's type.** Replay already refused unknown types, but only for records it replays.
+  - A record inside a discarded transaction was never looked at, so a version-1 statement record, or the reserved `TxnAbort`, would have gone unnoticed there.
+  - The first pass now refuses any type it does not know, wherever the record is. This was found by a test written for the reserved type.
+- **IDs are checked in recovery.** Each `TxnBegin` must name a non-zero ID greater than every earlier one in the log; a repeated or decreasing ID is corruption. Each `TxnCommit` must name the open transaction's ID.
+- **Inside a transaction, use the transaction's methods.** Once a transaction has written, it holds the executor's exclusive lock (section 2.6). The DB's own methods, `DB.Exec` or `DB.Prepare` included, called from the transaction's goroutine would wait for it forever. `Tx` documents this. A first version of the tests did exactly that: it prepared a statement mid-transaction and hung, which is what prompted the documentation.
+- **Rollback counts.** The executor counts rollbacks that reopened the database, alongside self-restarts. Tests use the count to prove that a read-only transaction's rollback reopens nothing.
+
+## 3. Formats (approved)
+
+These are the only on-disk changes in Step 6.1. The phase's rules approve a format change only for Step 6.3, so this one needed the maintainer's approval, which was given with the design.
 
 - **WAL format version 2.**
   - The checkpoint record's payload grows from 8 to 16 bytes: the redo LSN, then `NextXID`, both u64 little-endian.

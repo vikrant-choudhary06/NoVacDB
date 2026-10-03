@@ -89,6 +89,7 @@ type DB struct {
 	indexScans   atomic.Int64 // scans that used an index
 	rowsRead     atomic.Int64 // rows scans have read, before WHERE
 	restarts     atomic.Int64 // self-restarts after failed statements
+	rollbacks    atomic.Int64 // rollbacks of transactions that wrote
 }
 
 // Open opens the database in dir, creating it if it does not exist, and
@@ -128,8 +129,8 @@ func (db *DB) open(ctx context.Context) error {
 	db.e, db.cat = e, cat
 	// Opening ends with a checkpoint at the end of the recovered log.
 	db.lastCkpt = e.Recovery().EndLSN
-	if rec := e.Recovery(); rec.Replayed > 0 || rec.DiscardedStatements > 0 {
-		db.log.Info("recovered the database", "dir", db.dir, "replayed", rec.Replayed, "discarded_statements", rec.DiscardedStatements)
+	if rec := e.Recovery(); rec.Replayed > 0 || rec.DiscardedTransactions > 0 {
+		db.log.Info("recovered the database", "dir", db.dir, "replayed", rec.Replayed, "discarded_transactions", rec.DiscardedTransactions, "next_xid", rec.NextXID)
 	}
 	return nil
 }
@@ -148,10 +149,10 @@ func (db *DB) Close(ctx context.Context) error {
 	return db.e.Close(ctx)
 }
 
-// Exec runs the statements in sql in order and returns one result per
-// statement. It stops at the first error, returning the results of the
-// statements before it; each statement that succeeded stays committed.
-// Errors are *sqlerr.Error.
+// Exec runs the statements in sql in order, each in its own transaction
+// (autocommit), and returns one result per statement. It stops at the
+// first error, returning the results of the statements before it; each
+// statement that succeeded stays committed. Errors are *sqlerr.Error.
 func (db *DB) Exec(ctx context.Context, sql string) ([]*Result, error) {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
@@ -159,7 +160,7 @@ func (db *DB) Exec(ctx context.Context, sql string) ([]*Result, error) {
 	}
 	var results []*Result
 	for _, s := range stmts {
-		r, err := db.run(ctx, sql, s, nil, false)
+		r, err := db.run(ctx, nil, sql, s, nil, false)
 		if err != nil {
 			return results, err
 		}
@@ -172,15 +173,25 @@ func canceled(err error) *sqlerr.Error {
 	return sqlerr.Wrap(err, sqlerr.QueryCanceled, "canceling statement due to user request")
 }
 
-// run runs one statement under the database lock, with its parameters if
-// it has any. With describe set it only binds the statement, to learn its
+// run runs one statement under the database lock, in the transaction tx
+// or, if tx is nil, in its own (autocommit), with its parameters if it has
+// any. With describe set it only binds the statement, to learn its
 // parameters' types and result columns: nothing is read or changed, and a
 // statement that is not a query or a row change is not looked at.
-func (db *DB) run(ctx context.Context, sql string, s ast.Stmt, ps *params, describe bool) (*Result, error) {
-	if _, ok := s.(*ast.Select); ok || describe {
+//
+// A statement that may change data takes the lock exclusively; in a
+// transaction it keeps it until the transaction ends (tx.go).
+func (db *DB) run(ctx context.Context, tx *Tx, sql string, s ast.Stmt, ps *params, describe bool) (*Result, error) {
+	_, isSelect := s.(*ast.Select)
+	switch {
+	case tx != nil && tx.locked:
+	case isSelect || describe:
 		db.mu.RLock()
 		defer db.mu.RUnlock()
-	} else {
+	case tx != nil:
+		db.mu.Lock()
+		tx.locked = true
+	default:
 		db.mu.Lock()
 		defer db.mu.Unlock()
 	}
@@ -193,7 +204,7 @@ func (db *DB) run(ctx context.Context, sql string, s ast.Stmt, ps *params, descr
 	if err := ctx.Err(); err != nil {
 		return nil, canceled(err)
 	}
-	st := &stmt{db: db, ctx: ctx, sql: sql, ec: &evalCtx{now: types.TimestampFromTime(db.opts.Now())}, params: ps, describe: describe}
+	st := &stmt{db: db, tx: tx, ctx: ctx, sql: sql, ec: &evalCtx{now: types.TimestampFromTime(db.opts.Now())}, params: ps, describe: describe}
 	var r *Result
 	var err error
 	switch s.(type) {
@@ -255,6 +266,7 @@ func isCorruption(err error) bool {
 // stmt is one statement being run.
 type stmt struct {
 	db       *DB
+	tx       *Tx // nil for autocommit
 	ctx      context.Context
 	sql      string
 	ec       *evalCtx
@@ -266,62 +278,113 @@ type stmt struct {
 // table.
 func (st *stmt) binder() *binder { return &binder{sql: st.sql, params: st.params} }
 
-// tooMuch is the error for a statement that changes more pages than the
-// buffer pool holds.
-func (db *DB) tooMuch(err error) *sqlerr.Error {
+// tooMuch is the error for a statement, or a transaction, that changes
+// more pages than the buffer pool holds.
+func (db *DB) tooMuch(err error, inTx bool) *sqlerr.Error {
+	if inTx {
+		return sqlerr.Wrap(err, sqlerr.ProgramLimitExceeded, "transaction changes too much data").
+			WithHint("A transaction can change at most %d pages (the buffer pool's size) until the undo log arrives; split it into smaller transactions. It was rolled back.", db.opts.Frames)
+	}
 	return sqlerr.Wrap(err, sqlerr.ProgramLimitExceeded, "statement changes too much data").
-		WithHint("A statement can change at most %d pages (the buffer pool's size) until transactions arrive; split it into smaller statements.", db.opts.Frames)
+		WithHint("A statement can change at most %d pages (the buffer pool's size) until the undo log arrives; split it into smaller statements.", db.opts.Frames)
 }
 
-// apply runs fn, the change phase of a statement, in a statement group and
-// commits it. The caller holds the exclusive
-// lock and has already checked everything that can fail for SQL reasons.
+// apply runs fn, the change phase of a statement, as a write of its
+// transaction: in autocommit it commits it at once, in an explicit
+// transaction the transaction commits later. The caller holds the
+// exclusive lock and has already checked everything that can fail for SQL
+// reasons.
 //
-// If anything fails once the group has begun, the changes cannot be undone
-// in memory: the database restarts itself (closing as a crash would, then
-// reopening, which discards the group) and returns the error. With ddl
-// set, a *sqlerr.Error from fn means fn changed nothing (the catalog's
-// rule), so the group commits and the error is returned.
+// If anything fails once the transaction has begun writing, its changes
+// cannot be undone in memory: the database restarts itself (closing as a
+// crash would, then reopening, which discards the transaction) and returns
+// the error. With ddl set, a *sqlerr.Error from fn means fn changed
+// nothing (the catalog's rule), so the transaction goes on and the error
+// is returned.
 //
 // Cancellation is not honoured from here on: a statement that has begun
 // changing data runs to its end.
 func (st *stmt) apply(ddl bool, fn func(ctx context.Context) error) error {
 	db := st.db
 	ctx := context.WithoutCancel(st.ctx)
-	if err := db.e.BeginStatement(ctx); err != nil {
-		return db.restart(ctx, err)
+	var wtx *wal.Txn
+	if st.tx != nil {
+		if st.tx.wtx == nil {
+			st.tx.wtx = db.e.Begin()
+		}
+		wtx = st.tx.wtx
+	} else {
+		wtx = db.e.Begin()
 	}
-	ferr := fn(ctx)
 	var se *sqlerr.Error
-	if ferr != nil && (!ddl || !errors.As(ferr, &se)) {
-		return db.restart(ctx, ferr)
-	}
-	lsn, err := db.e.CommitStatement(ctx)
-	if err != nil {
-		return db.restart(ctx, err)
-	}
-	if ferr != nil {
+	err := wtx.Write(ctx, func(ctx context.Context) error {
+		ferr := fn(ctx)
+		if ddl && errors.As(ferr, &se) {
+			return wal.Unchanged(ferr)
+		}
 		return ferr
+	})
+	switch {
+	case err == nil:
+	case ddl && errors.As(err, &se):
+		if st.tx == nil {
+			if _, cerr := wtx.Commit(ctx); cerr != nil {
+				return db.restart(ctx, cerr, false)
+			}
+		}
+		return se
+	default:
+		if st.tx != nil {
+			st.tx.discarded = true
+		}
+		return db.restart(ctx, err, st.tx != nil)
+	}
+	if st.tx != nil {
+		return nil
+	}
+	lsn, err := wtx.Commit(ctx)
+	if err != nil {
+		return db.restart(ctx, err, false)
 	}
 	db.maybeCheckpoint(ctx, lsn)
 	return nil
 }
 
 // restart abandons the engine and reopens the database after a failed
-// statement, and returns the statement's error for the client.
-func (db *DB) restart(ctx context.Context, cause error) error {
-	db.log.Warn("a statement failed while changing data; restarting the database", "dir", db.dir, "err", cause)
+// statement or commit, and returns the error for the client. The writing
+// transaction, if any, is discarded by recovery.
+func (db *DB) restart(ctx context.Context, cause error, inTx bool) error {
+	db.log.Warn("a change failed; restarting the database", "dir", db.dir, "err", cause)
 	db.restarts.Add(1)
 	_ = db.e.Abandon()
+	db.reopen(ctx)
+	if errors.Is(cause, storage.ErrNoFreeFrames) {
+		return db.tooMuch(cause, inTx)
+	}
+	return publicError(cause)
+}
+
+// discard rolls back a transaction that changed something: the engine is
+// abandoned and the database reopens, and recovery leaves it out (Step 6.1
+// has no undo: docs/design/13-transactions.md section 2.6).
+func (db *DB) discard(ctx context.Context, wtx *wal.Txn) error {
+	db.log.Info("rolling back a transaction: reopening the database", "dir", db.dir, "xid", wtx.XID())
+	db.rollbacks.Add(1)
+	_ = wtx.Rollback(ctx)
+	db.reopen(ctx)
+	if db.broken != nil {
+		return sqlerr.Wrap(db.broken, sqlerr.IOError, "the database is unavailable: reopening it after a rollback failed: %v", db.broken)
+	}
+	return nil
+}
+
+// reopen opens the database again after the engine was abandoned.
+func (db *DB) reopen(ctx context.Context) {
 	db.e, db.cat = nil, nil
 	if err := db.open(ctx); err != nil {
 		db.broken = err
-		db.log.Error("restarting the database failed", "dir", db.dir, "err", err)
+		db.log.Error("reopening the database failed", "dir", db.dir, "err", err)
 	}
-	if errors.Is(cause, storage.ErrNoFreeFrames) {
-		return db.tooMuch(cause)
-	}
-	return publicError(cause)
 }
 
 // maybeCheckpoint takes a checkpoint once the WAL has grown enough since

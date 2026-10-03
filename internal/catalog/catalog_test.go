@@ -68,16 +68,14 @@ func (d *db) close(t *testing.T) {
 // engine is abandoned, as the executor does.
 func (d *db) stmt(t *testing.T, fn func() error) error {
 	t.Helper()
-	if err := d.e.BeginStatement(bg); err != nil {
-		t.Fatal(err)
-	}
-	if err := fn(); err != nil {
+	tx := d.e.Begin()
+	if err := tx.Write(bg, func(context.Context) error { return fn() }); err != nil {
 		if aerr := d.e.Abandon(); aerr != nil {
 			t.Fatal(aerr)
 		}
 		return err
 	}
-	if _, err := d.e.CommitStatement(bg); err != nil {
+	if _, err := tx.Commit(bg); err != nil {
 		t.Fatal(err)
 	}
 	return nil
@@ -194,11 +192,11 @@ func TestDDLIsAtomicAcrossCrash(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// A CREATE TABLE whose statement never commits.
-	if err := d.e.BeginStatement(bg); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := d.c.CreateTable(bg, usersDef(t)); err != nil {
+	// A CREATE TABLE whose transaction never commits.
+	if err := d.e.Begin().Write(bg, func(context.Context) error {
+		_, err := d.c.CreateTable(bg, usersDef(t))
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 	m.Crash(vfs.CrashOptions{})
@@ -735,23 +733,21 @@ func TestDDLUnderIOFailures(t *testing.T) {
 				m.InjectError(vfs.Fault{Op: op, After: n})
 			}
 			atCommit := false
-			err := d.e.BeginStatement(bg)
-			if err == nil {
-				err = func() error {
-					if _, err := d.c.CreateTable(bg, usersDef(t)); err != nil {
-						return err
-					}
-					if _, err := d.c.CreateIndex(bg, base, "", []string{"b", "a"}, true); err != nil {
-						return err
-					}
-					gone, _ := d.c.Table("gone")
-					if _, err := d.c.DropTable(bg, gone); err != nil {
-						return err
-					}
-					atCommit = true
-					_, err := d.e.CommitStatement(bg)
+			tx := d.e.Begin()
+			err := tx.Write(bg, func(context.Context) error {
+				if _, err := d.c.CreateTable(bg, usersDef(t)); err != nil {
 					return err
-				}()
+				}
+				if _, err := d.c.CreateIndex(bg, base, "", []string{"b", "a"}, true); err != nil {
+					return err
+				}
+				gone, _ := d.c.Table("gone")
+				_, err := d.c.DropTable(bg, gone)
+				return err
+			})
+			if err == nil {
+				atCommit = true
+				_, err = tx.Commit(bg)
 			}
 			if want == "" {
 				if err != nil {

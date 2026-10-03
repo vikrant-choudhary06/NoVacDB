@@ -83,6 +83,8 @@ A key longer than a B+Tree key may be (1024 bytes, RID included) is rejected wit
 
 ### 2.4 Statements are atomic (Step 4.4)
 
+*Since Step 6.1, statement groups are replaced by transactions (13-transactions.md): each statement outside an explicit transaction runs in its own autocommit transaction, whose `TxnBegin` and `TxnCommit` records (types 7 and 8, with the transaction ID) take the place of the statement records (types 4 and 5) below. The rules of this section, "no steal", recovery skipping what never committed, and the restart after a failure, are unchanged.*
+
 Every statement that changes the database runs as a **statement group** in the WAL:
 
 1. `Engine.BeginStatement` appends a *statement-begin* record (type 4) and sets the **commit horizon** to its LSN.

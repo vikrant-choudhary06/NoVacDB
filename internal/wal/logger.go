@@ -13,18 +13,24 @@ const (
 	// RecordHeap is a heap operation (storage.DecodeHeapRecord).
 	RecordHeap RecordType = 1
 	// RecordCheckpoint marks a completed checkpoint; its payload is the
-	// redo LSN.
+	// redo LSN and the next transaction ID, u64 each.
 	RecordCheckpoint RecordType = 2
 	// RecordBTree is a B+Tree change (btree.DecodeRecord).
 	RecordBTree RecordType = 3
-	// RecordStmtBegin starts a statement group; its payload is empty.
-	RecordStmtBegin RecordType = 4
-	// RecordStmtCommit ends a statement group; its payload is the begin
-	// record's LSN.
-	RecordStmtCommit RecordType = 5
+	// Types 4 and 5 were statement groups (format version 1), replaced by
+	// transactions.
+
 	// RecordDeferredFree lists pages to free once a checkpoint's redo point
 	// is past a given LSN (EncodeDeferredFree).
 	RecordDeferredFree RecordType = 6
+	// RecordTxnBegin starts a writing transaction; its payload is the XID
+	// (u64).
+	RecordTxnBegin RecordType = 7
+	// RecordTxnCommit commits a transaction; its payload is the XID.
+	RecordTxnCommit RecordType = 8
+	// RecordTxnAbort is reserved for Step 6.5's rollback; nothing writes
+	// it yet, and recovery refuses it as an unknown type.
+	RecordTxnAbort RecordType = 9
 )
 
 // Logger connects heaps and B+Trees to the log (it implements

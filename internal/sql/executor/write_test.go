@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -320,13 +322,17 @@ func TestMissingIndexEntryIsCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.e.BeginStatement(bg); err != nil {
+	wtx := db.e.Begin()
+	if err := wtx.Write(bg, func(context.Context) error {
+		found, err := ix.Tree.Delete(bg, key)
+		if err == nil && !found {
+			err = errors.New("no entry")
+		}
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if found, err := ix.Tree.Delete(bg, key); err != nil || !found {
-		t.Fatal(found, err)
-	}
-	if _, err := db.e.CommitStatement(bg); err != nil {
+	if _, err := wtx.Commit(bg); err != nil {
 		t.Fatal(err)
 	}
 	restarts := db.restarts.Load()

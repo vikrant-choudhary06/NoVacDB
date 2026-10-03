@@ -1,0 +1,139 @@
+package executor
+
+import (
+	"context"
+
+	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/parser"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/sqlerr"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/types"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/wal"
+)
+
+// Tx is an explicit transaction (docs/design/13-transactions.md section
+// 2.5): its statements commit or roll back together. It is not safe for
+// concurrent use.
+//
+// Until row versions and locks exist (section 2.6), a transaction that has
+// changed something holds the database's exclusive lock until it ends: no
+// other statement runs meanwhile, in any session, so nobody sees its
+// uncommitted changes. Calling the DB's own methods from the goroutine of
+// such a transaction would wait for the transaction itself; use the Tx's
+// methods.
+type Tx struct {
+	db  *DB
+	wtx *wal.Txn // nil until the first change
+	// locked: the transaction holds db.mu exclusively.
+	locked bool
+	// failed: a statement failed; only Rollback (or Commit, which rolls
+	// back) is left.
+	failed bool
+	// discarded: a restart after a failure already removed its changes.
+	discarded bool
+	done      bool
+}
+
+// Begin starts a transaction. It takes no lock and no transaction ID until
+// its first change.
+func (db *DB) Begin(ctx context.Context) (*Tx, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, canceled(err)
+	}
+	return &Tx{db: db}, nil
+}
+
+func (tx *Tx) usable() error {
+	switch {
+	case tx.done:
+		return sqlerr.New(sqlerr.InvalidTransactionState, "the transaction has already ended")
+	case tx.failed:
+		return sqlerr.New(sqlerr.InFailedSQLTransaction, "current transaction is aborted, commands ignored until end of transaction block")
+	}
+	return nil
+}
+
+// Exec runs the statements in sql in the transaction. The first error
+// leaves the transaction failed: later statements return 25P02 until it
+// ends.
+func (tx *Tx) Exec(ctx context.Context, sql string) ([]*Result, error) {
+	if err := tx.usable(); err != nil {
+		return nil, err
+	}
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		tx.failed = true
+		return nil, sqlerr.From(err)
+	}
+	var results []*Result
+	for _, s := range stmts {
+		r, err := tx.db.run(ctx, tx, sql, s, nil, false)
+		if err != nil {
+			tx.failed = true
+			return results, err
+		}
+		results = append(results, r)
+	}
+	return results, nil
+}
+
+// ExecPrepared runs a prepared statement in the transaction, as
+// DB.ExecPrepared does outside one.
+func (tx *Tx) ExecPrepared(ctx context.Context, p *Prepared, values []types.Value) (*Result, error) {
+	if err := tx.usable(); err != nil {
+		return nil, err
+	}
+	r, err := tx.db.execPrepared(ctx, tx, p, values)
+	if err != nil {
+		tx.failed = true
+	}
+	return r, err
+}
+
+// Commit commits the transaction. A failed transaction is rolled back
+// instead, and Commit reports 25P02.
+func (tx *Tx) Commit(ctx context.Context) error {
+	if tx.done {
+		return sqlerr.New(sqlerr.InvalidTransactionState, "the transaction has already ended")
+	}
+	if tx.failed {
+		if err := tx.Rollback(ctx); err != nil {
+			return err
+		}
+		return sqlerr.New(sqlerr.InFailedSQLTransaction, "current transaction is aborted: it was rolled back, not committed")
+	}
+	db := tx.db
+	defer tx.end()
+	if tx.wtx == nil {
+		return nil
+	}
+	ctx = context.WithoutCancel(ctx)
+	lsn, err := tx.wtx.Commit(ctx)
+	if err != nil {
+		// Outcome unknown until recovery decides it.
+		return db.restart(ctx, err, true)
+	}
+	db.maybeCheckpoint(ctx, lsn)
+	return nil
+}
+
+// Rollback ends the transaction without its changes. A transaction that
+// changed something is discarded the way Step 6.1 can: the database
+// reopens, and recovery leaves the transaction out (section 2.6).
+func (tx *Tx) Rollback(ctx context.Context) error {
+	if tx.done {
+		return sqlerr.New(sqlerr.InvalidTransactionState, "the transaction has already ended")
+	}
+	defer tx.end()
+	if tx.wtx == nil || tx.discarded {
+		return nil
+	}
+	return tx.db.discard(context.WithoutCancel(ctx), tx.wtx)
+}
+
+// end marks the transaction over and releases the lock it holds.
+func (tx *Tx) end() {
+	tx.done = true
+	if tx.locked {
+		tx.locked = false
+		tx.db.mu.Unlock()
+	}
+}

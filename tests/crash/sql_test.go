@@ -233,13 +233,15 @@ func dumpSQL(db *executor.DB) (string, error) {
 
 type sqlScenarioStats struct {
 	statements, ddl, crashes, faultStops, midStatement, keptInFlight, lostInFlight, torn, kills int
+	txCommits, txRollbacks, txOpenAtCrash                                                       int
 }
 
-// runSQLScenario runs one seeded scenario: cycles of random statements,
-// sometimes stopped by an injected fault (after which the database restarts
-// itself, or, if that fails too, is left mid-statement), then a crash and
-// a recovery that must hold every acknowledged statement, and each other
-// statement entirely or not at all.
+// runSQLScenario runs one seeded scenario: cycles of random statements and
+// transactions of several statements (committed, rolled back, or open when
+// the crash comes), sometimes stopped by an injected fault (after which the
+// database restarts itself, or, if that fails too, is left mid-statement),
+// then a crash and a recovery that must hold every acknowledged statement
+// and transaction, and each other one entirely or not at all.
 func runSQLScenario(t *testing.T, seed uint64) (st sqlScenarioStats) {
 	t.Helper()
 	fail := func(format string, args ...any) {
@@ -287,7 +289,69 @@ func runSQLScenario(t *testing.T, seed uint64) (st sqlScenarioStats) {
 			}
 		}
 		candidates := []sqlModel{acked}
+		var openTx *executor.Tx // a transaction left open for the crash
+	units:
 		for range 5 + ctl.IntN(40) {
+			if rng.IntN(4) == 0 {
+				// A transaction of several statements, which see each
+				// other's changes; acknowledged only by its commit.
+				tx, err := db.Begin(bg)
+				if err != nil {
+					fail("cycle %d: begin: %v", cycle, err)
+				}
+				after := acked.clone()
+				for range 2 + rng.IntN(4) {
+					s := nextStatement(rng, after, &nextID)
+					st.statements++
+					if s.ddl {
+						st.ddl++
+					}
+					if _, err := tx.Exec(bg, s.sql); err != nil {
+						code := sqlerr.Code(err)
+						if code != sqlerr.ProgramLimitExceeded && !errors.Is(err, vfs.ErrInjected) && code != sqlerr.IOError {
+							fail("cycle %d: in a transaction: %s: %v", cycle, s.sql, err)
+						}
+						// Discarded by the restart (or the database is
+						// unavailable): only the acknowledged state remains.
+						_ = tx.Rollback(bg)
+						if code == sqlerr.ProgramLimitExceeded {
+							continue units
+						}
+						st.faultStops++
+						break units
+					}
+					s.apply(&after)
+				}
+				switch rng.IntN(5) {
+				case 0:
+					openTx = tx // the crash comes with it open
+					st.txOpenAtCrash++
+					break units
+				case 1:
+					if err := tx.Rollback(bg); err != nil {
+						if !errors.Is(err, vfs.ErrInjected) && sqlerr.Code(err) != sqlerr.IOError {
+							fail("cycle %d: rollback: %v", cycle, err)
+						}
+						st.faultStops++
+						break units
+					}
+					st.txRollbacks++
+				default:
+					if err := tx.Commit(bg); err != nil {
+						if !errors.Is(err, vfs.ErrInjected) && sqlerr.Code(err) != sqlerr.IOError {
+							fail("cycle %d: commit: %v", cycle, err)
+						}
+						// The commit may or may not have happened.
+						st.faultStops++
+						candidates = []sqlModel{acked, after}
+						break units
+					}
+					st.txCommits++
+					acked = after
+					candidates = []sqlModel{acked}
+				}
+				continue
+			}
 			s := nextStatement(rng, acked, &nextID)
 			after := acked.clone()
 			s.apply(&after)
@@ -313,9 +377,12 @@ func runSQLScenario(t *testing.T, seed uint64) (st sqlScenarioStats) {
 			candidates = []sqlModel{acked, after}
 			break
 		}
-		// Was the database left mid-statement (its restart failed)?
-		if _, err := db.Exec(bg, "SELECT 1"); err != nil {
-			st.midStatement++
+		// Was the database left mid-statement (its restart failed)? A
+		// transaction left open holds the database: no probe then.
+		if openTx == nil {
+			if _, err := db.Exec(bg, "SELECT 1"); err != nil {
+				st.midStatement++
+			}
 		}
 		m.ClearFaults()
 		switch ctl.IntN(4) {
@@ -375,6 +442,9 @@ func TestSQLCrashRecovery(t *testing.T) {
 		total.lostInFlight += st.lostInFlight
 		total.torn += st.torn
 		total.kills += st.kills
+		total.txCommits += st.txCommits
+		total.txRollbacks += st.txRollbacks
+		total.txOpenAtCrash += st.txOpenAtCrash
 	}
 	t.Logf("%d runs: %+v", runs, total)
 	if runs >= 30 {
@@ -382,6 +452,8 @@ func TestSQLCrashRecovery(t *testing.T) {
 			"DDL statements": total.ddl, "statements stopped by a fault": total.faultStops,
 			"crashes in the middle of a statement": total.midStatement,
 			"in-flight statements lost":            total.lostInFlight, "torn crashes": total.torn, "process kills": total.kills,
+			"committed transactions": total.txCommits, "rolled-back transactions": total.txRollbacks,
+			"transactions open at a crash": total.txOpenAtCrash,
 		} {
 			if n < runs/10 {
 				t.Errorf("only %d %s in %d runs: the scenario is not exercising enough", n, name, runs)

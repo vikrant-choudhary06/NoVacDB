@@ -130,21 +130,25 @@ func Open(ctx context.Context, e *wal.Engine, fsys vfs.FS, dir string) (*Catalog
 	return c, nil
 }
 
-// bootstrap creates the system tables in one statement group, then
-// records them in the catalog file.
+// bootstrap creates the system tables in one transaction, then records
+// them in the catalog file.
 func (c *Catalog) bootstrap(ctx context.Context, fsys vfs.FS, dir string) error {
-	if err := c.e.BeginStatement(ctx); err != nil {
-		return err
-	}
 	var firsts [numSys]uint64
-	for i := range c.sys {
-		h, err := c.e.CreateHeap(ctx)
-		if err != nil {
-			return err // the caller abandons the engine
+	tx := c.e.Begin()
+	err := tx.Write(ctx, func(ctx context.Context) error {
+		for i := range c.sys {
+			h, err := c.e.CreateHeap(ctx)
+			if err != nil {
+				return err
+			}
+			c.sys[i], firsts[i] = h, h.FirstPage()
 		}
-		c.sys[i], firsts[i] = h, h.FirstPage()
+		return nil
+	})
+	if err != nil {
+		return err // the caller abandons the engine
 	}
-	if _, err := c.e.CommitStatement(ctx); err != nil {
+	if _, err := tx.Commit(ctx); err != nil {
 		return err
 	}
 	return writeFile(fsys, dir, firsts)

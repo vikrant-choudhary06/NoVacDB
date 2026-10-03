@@ -121,19 +121,14 @@ func TestCheckpointLogsWaitingPagesAgain(t *testing.T) {
 	}
 }
 
-func TestDiscardedStatementsDeferNothing(t *testing.T) {
+func TestDiscardedTxnsDeferNothing(t *testing.T) {
 	m := newFS(t)
 	e := mustEngine(t, m, EngineOptions{Frames: 32})
 	page, err := e.dm.Allocate(bg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := e.BeginStatement(bg); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.Logger().DeferFree(bg, page); err != nil {
-		t.Fatal(err)
-	}
+	openTxn(t, e, func() error { return e.Logger().DeferFree(bg, page) })
 	if err := e.w.Flush(bg); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +137,7 @@ func TestDiscardedStatementsDeferNothing(t *testing.T) {
 	e2 := mustEngine(t, m, EngineOptions{Frames: 32})
 	defer func() { _ = e2.Close(bg) }()
 	if e2.Recovery().DeferredFrees != 0 || e2.FreePageCount() != free {
-		t.Fatalf("an uncommitted statement's deferred free was applied: %+v", e2.Recovery())
+		t.Fatalf("an uncommitted transaction's deferred free was applied: %+v", e2.Recovery())
 	}
 }
 

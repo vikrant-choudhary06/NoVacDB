@@ -24,8 +24,8 @@ type dataSyncer interface {
 }
 
 // checkpointPayloadSize is the size of a checkpoint record's payload: the
-// redo LSN, uint64 little-endian.
-const checkpointPayloadSize = 8
+// redo LSN, then the next transaction ID, uint64 little-endian each.
+const checkpointPayloadSize = 16
 
 // Checkpointer takes checkpoints: it bounds how much log recovery must
 // replay and lets old segments be deleted. See
@@ -39,6 +39,9 @@ type Checkpointer struct {
 	data  dataSyncer
 
 	mu sync.Mutex // one checkpoint at a time
+	// nextXID, if set (by the Engine), gives the next transaction ID the
+	// checkpoint record carries; without it the record carries 0.
+	nextXID func() XID
 }
 
 // NewCheckpointer returns a Checkpointer for the log w (with its Logger lg),
@@ -73,7 +76,12 @@ func (c *Checkpointer) Checkpoint(ctx context.Context) (Control, error) {
 		return Control{}, fmt.Errorf("checkpoint: syncing data: %w", err)
 	}
 	// 4. The checkpoint record, durable.
+	var next XID
+	if c.nextXID != nil {
+		next = c.nextXID()
+	}
 	payload := binary.LittleEndian.AppendUint64(nil, uint64(redo))
+	payload = binary.LittleEndian.AppendUint64(payload, uint64(next))
 	ckpt, err := c.w.Append(ctx, RecordCheckpoint, payload)
 	if err != nil {
 		return Control{}, fmt.Errorf("checkpoint: logging: %w", err)

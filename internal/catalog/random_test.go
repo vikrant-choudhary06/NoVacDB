@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -178,16 +179,23 @@ func (r *rdb) op(rows map[string]int) ([]uint64, error) {
 // and the database crashes instead.
 func (r *rdb) statement(crash bool) (sqlErrors int) {
 	t := r.t
-	if err := r.d.e.BeginStatement(bg); err != nil {
-		t.Fatal(err)
-	}
+	tx := r.d.e.Begin()
 	rows := map[string]int{}
 	for k, v := range r.rows {
 		rows[k] = v
 	}
 	var free []uint64
 	for range 1 + r.rng.IntN(4) {
-		pages, err := r.op(rows)
+		var pages []uint64
+		err := tx.Write(bg, func(context.Context) error {
+			var err error
+			pages, err = r.op(rows)
+			var se *sqlerr.Error
+			if errors.As(err, &se) {
+				return wal.Unchanged(err) // the catalog's rule: nothing changed
+			}
+			return err
+		})
 		var se *sqlerr.Error
 		switch {
 		case errors.As(err, &se):
@@ -208,11 +216,11 @@ func (r *rdb) statement(crash bool) (sqlErrors int) {
 		return sqlErrors
 	}
 	// Dropped pages are freed later, as the executor does: the request is
-	// logged inside the statement group.
-	if err := r.d.e.Logger().DeferFree(bg, free...); err != nil {
+	// logged inside the transaction.
+	if err := tx.Write(bg, func(context.Context) error { return r.d.e.Logger().DeferFree(bg, free...) }); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.d.e.CommitStatement(bg); err != nil {
+	if _, err := tx.Commit(bg); err != nil {
 		t.Fatal(err)
 	}
 	r.state, r.rows = describeAll(r.d.c), rows

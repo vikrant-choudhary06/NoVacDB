@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"testing"
@@ -192,6 +193,86 @@ func FuzzReader(f *testing.F) {
 		kept, _ := readLog(t, fsys, testDir)
 		if len(kept) != len(got) {
 			t.Fatalf("reader returned %d records, recovery kept %d", len(got), len(kept))
+		}
+	})
+}
+
+// FuzzTxnRecovery appends arbitrary transaction and checkpoint records
+// (types and payloads from the input) to a fresh engine's log and
+// recovers it. Recovery either refuses the log as corrupt or succeeds; on
+// success NextXID is past every ID a begin record named, and the status
+// table agrees with the log: a begin followed by its commit is committed,
+// any other begin aborted.
+func FuzzTxnRecovery(f *testing.F) {
+	u64 := func(v uint64) []byte { return binary.LittleEndian.AppendUint64(nil, v) }
+	enc := func(recs ...[]byte) []byte { return bytes.Join(recs, nil) }
+	rec := func(typ byte, payload []byte) []byte { return append([]byte{typ, byte(len(payload))}, payload...) }
+	f.Add(enc(rec(7, u64(1)), rec(8, u64(1)), rec(7, u64(2))))
+	f.Add(enc(rec(7, u64(3)), rec(2, append(u64(0), u64(10)...)), rec(7, u64(4)), rec(8, u64(4))))
+	f.Add(enc(rec(8, u64(1))))
+	f.Add(enc(rec(7, u64(5)), rec(7, u64(5))))
+	f.Add(enc(rec(9, u64(1)), rec(4, nil)))
+	f.Fuzz(func(t *testing.T, in []byte) {
+		m := vfs.NewMemFS(1)
+		_ = m.MkdirAll("/db")
+		_ = m.SyncDir("/")
+		e, err := OpenEngine(bg, m, dbDir, EngineOptions{Frames: 8})
+		if err != nil {
+			t.Fatal(err)
+		}
+		begins := map[XID]bool{} // ID -> committed by the next commit record
+		var openXID XID
+		var maxBegin XID
+		for len(in) >= 2 {
+			typ, n := RecordType(in[0]%10), int(in[1])
+			in = in[2:]
+			if n > len(in) {
+				n = len(in)
+			}
+			payload := in[:n]
+			in = in[n:]
+			if typ == 0 || typ == RecordHeap || typ == RecordBTree || typ == RecordDeferredFree {
+				continue // 0 is never a type; the others' payloads are fuzzed elsewhere
+			}
+			if _, err := e.w.Append(bg, typ, payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload) == 8 {
+				xid := XID(binary.LittleEndian.Uint64(payload))
+				switch typ {
+				case RecordTxnBegin:
+					begins[xid], openXID = false, xid
+					maxBegin = max(maxBegin, xid)
+				case RecordTxnCommit:
+					if xid == openXID {
+						begins[xid] = true
+					}
+				}
+			}
+		}
+		if err := e.w.Flush(bg); err != nil {
+			t.Fatal(err)
+		}
+		m.Crash(vfs.CrashOptions{})
+		e2, err := OpenEngine(bg, m, dbDir, EngineOptions{Frames: 8})
+		if err != nil {
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("recovery failed with %v, not corruption", err)
+			}
+			return
+		}
+		defer func() { _ = e2.Close(bg) }()
+		if maxBegin != 0 && e2.NextXID() <= maxBegin {
+			t.Fatalf("next ID %d, but the log began %d", e2.NextXID(), maxBegin)
+		}
+		for xid, committed := range begins {
+			want := TxnAborted
+			if committed {
+				want = TxnCommitted
+			}
+			if got := e2.Status(xid); got != want {
+				t.Fatalf("transaction %d: %v, want %v", xid, got, want)
+			}
 		}
 	})
 }

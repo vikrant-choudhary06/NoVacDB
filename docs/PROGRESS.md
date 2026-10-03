@@ -8,7 +8,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 
 ## Current step
 
-👉 **Step 6.1 — Transaction manager** (design doc `13-transactions.md` awaiting review)
+👉 **Step 6.2 — Undo log** (design doc `14-undo-log.md` comes first, for review)
 
 ---
 
@@ -17,6 +17,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 | Date | Step | Result | Notes |
 |---|---|---|---|
 | 2026-10-03 | 6.0 B+Tree review follow-ups | ✅ Done | Every item was already done by B+Tree design revision 2 (commits `d1f85dd`, `5b5e6d3`): leaf cell `Flags` byte with data format version 2; deferred frees logged (WAL type 6), re-logged by checkpoints and replayed by recovery, with crash tests; the deadlock-freedom argument in `08-btree.md` section 2.9 corrected and `TestConcurrentLeftSiblingRepairs` added; full-page images (problem #8 stays open) and root X-latching in the Limitations. Checked again against the code and docs; nothing left to do. |
+| 2026-10-03 | 6.1 Transaction manager | ✅ Done | Design doc `13-transactions.md` (reviewed and approved, including WAL format version 2). 64-bit transaction IDs allocated on the first write and never reused (`NextXID` in checkpoint records, recovered as the maximum of checkpoints and logged IDs); `TxnBegin`/`TxnCommit` records (types 7, 8) replace statement groups; a status table (active, committed, aborted, resolved, unknown) bounded to two checkpoint intervals; `wal.Txn` and executor `Tx` with `Begin`/`Exec`/`ExecPrepared`/`Commit`/`Rollback`, autocommit for everything else, `25P02` after a failure. Interim until undo, versions and locks: one writing transaction at a time holding the exclusive lock, rollback by reopening, size bounded by the pool. Recovery's first pass now refuses unknown record types anywhere (found by a test for the reserved type). Model-checked random transactions with crashes; crash harness with transactions (3000 scenarios: about 11k commits, 2.8k rollbacks, 3.7k open at a crash, all matched); `FuzzTxnRecovery`. 40 deliberate-bug checks: 38 caught (4 after new tests, one of which showed a test passing by accident), 2 found redundant code (removed). |
 
 ---
 
@@ -83,7 +84,7 @@ flowchart TB
 
 ---
 
-### 👉 Step 6.1 — Transaction manager
+### ✅ Step 6.1 — Transaction manager
 
 **Goal:** Group many statements into one all-or-nothing unit.
 
@@ -100,7 +101,7 @@ flowchart TB
 
 ---
 
-### ⬜ Step 6.2 — Undo log
+### 👉 Step 6.2 — Undo log
 
 **Goal:** A separate, self-contained home for old row versions.
 

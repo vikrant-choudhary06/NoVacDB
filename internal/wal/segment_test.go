@@ -25,7 +25,7 @@ func TestSegmentHeaderGoldenBytes(t *testing.T) {
 	enc := AppendSegmentHeader(nil, 0x1122334455667788)
 	want := make([]byte, SegmentHeaderSize)
 	copy(want[4:], "NOVAWAL\x00")
-	binary.LittleEndian.PutUint32(want[12:], 1)
+	binary.LittleEndian.PutUint32(want[12:], 2) // format version 2 (Step 6.1)
 	binary.LittleEndian.PutUint64(want[16:], 0x1122334455667788)
 	crc := crc32.Checksum(want[4:], crc32.MakeTable(crc32.Castagnoli))
 	binary.LittleEndian.PutUint32(want, crc)
@@ -61,7 +61,8 @@ func TestSegmentHeaderErrors(t *testing.T) {
 		{"short", AppendSegmentHeader(nil, 0)[:31], ErrCorrupt},
 		{"zeros", make([]byte, SegmentHeaderSize), ErrCorrupt},
 		{"wrong magic", reseal(func(b []byte) { b[4] = 'X' }), ErrBadMagic},
-		{"version 2", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 2) }), ErrUnsupportedVersion},
+		{"version 3", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 3) }), ErrUnsupportedVersion},
+		{"version 1", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 1) }), ErrUnsupportedVersion},
 		{"version 0", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 0) }), ErrUnsupportedVersion},
 		{"reserved bytes set", reseal(func(b []byte) { b[24] = 1 }), ErrCorrupt},
 	}
