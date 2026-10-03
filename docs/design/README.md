@@ -21,3 +21,4 @@ Failure & crash, Alternatives, Testing plan, Limitations.
 | [10](10-executor.md) | SQL types, rows, catalog, atomic statements, executor (`internal/sql/types`, `internal/catalog`, `internal/sql/executor`) | Implemented |
 | [11](11-sql-logic-tests.md) | SQL logic tests and the SQL crash workload (`tests/sqllogic`, `tests/crash`) | Implemented |
 | [12](12-wire-protocol.md) | PostgreSQL wire protocol (`internal/pgwire`, `internal/server`) | Implemented (Phase 5 complete) |
+| [13](13-transactions.md) | Transactions (`internal/wal`, `internal/sql/executor`) | Step 6.1 designed, awaiting review |
