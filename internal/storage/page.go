@@ -55,11 +55,14 @@ const (
 	PageTypeBTreeInternal PageType = 4
 	// PageTypeBTreeLeaf is a B+Tree leaf node (Step 3.1).
 	PageTypeBTreeLeaf PageType = 5
+	// PageTypeUndo is a page of an undo segment (Step 6.2,
+	// docs/design/14-undo-log.md).
+	PageTypeUndo PageType = 6
 )
 
 // Valid reports whether t is a known, non-zero page type.
 func (t PageType) Valid() bool {
-	return t >= PageTypeFileHeader && t <= PageTypeBTreeLeaf
+	return t >= PageTypeFileHeader && t <= PageTypeUndo
 }
 
 // Sentinel errors returned (wrapped) by the functions in this file.

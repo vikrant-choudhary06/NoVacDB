@@ -1,6 +1,6 @@
 # 14 — Undo Log (`internal/undo`, `internal/wal`)
 
-Status: **Step 6.2 designed; awaiting review.**
+Status: **Step 6.2 (undo log) designed, approved and implemented** (notes in section 2.8).
 
 ## 1. Problem
 
@@ -53,8 +53,8 @@ A transaction gets an **undo segment** at its first undo record. A segment is a 
 
 Rollback (Step 6.9) and purge (Step 6.8) must find every segment that still exists after a crash. The engine keeps a **segment table** in memory: transaction ID → first page. It is made durable with the same pattern that already makes deferred frees durable (08-btree.md section 2.7):
 
-- **Creating a segment** logs an `UndoSegment` record naming the transaction and its first page, before the segment's first page is written.
-- **Releasing a segment** logs an `UndoSegment` record that drops it, with the deferred free of its pages.
+- **Creating a segment** logs an `UndoSegment` record naming the transaction and its first page, right after the log record holding that page's image (section 2.8), so the table never names a page recovery has no image of.
+- **Releasing a segment** logs an `UndoSegment` record that drops it, then the deferred free of its pages. A crash between the two leaks the pages; the other order could free pages the table still names.
 - **Every checkpoint logs the whole table again** after its redo point, so recovery from that redo point sees every live segment without the log before it.
 - **Recovery rebuilds the table** from these records.
 
@@ -70,7 +70,7 @@ type Kind uint8 // Insert, Update, Delete
 
 type Record struct {
 	Kind       Kind
-	XID        wal.XID
+	XID        uint64 // a wal.XID (section 2.8)
 	PrevForRow Ptr    // the row's previous undo record, 0 if none
 	PrevInTxn  Ptr    // the transaction's previous record, 0 if first
 	Table      uint64 // catalog table ID
@@ -80,14 +80,17 @@ type Record struct {
 
 func (l *Log) Append(ctx context.Context, rec Record) (Ptr, error) // in rec.XID's segment, created if needed
 func (l *Log) Read(ctx context.Context, p Ptr) (Record, error)
-func (l *Log) Last(xid wal.XID) Ptr                             // the transaction's latest record
-func (l *Log) Release(ctx context.Context, xid wal.XID) error
-func (l *Log) Segments() []wal.XID
+func (l *Log) Last(xid uint64) Ptr                              // the transaction's latest record
+func (l *Log) Pages(xid uint64) []uint64                        // the segment's pages, in chain order
+func (l *Log) Release(ctx context.Context, xid uint64) error
+func (l *Log) Segments() []uint64
 ```
+
+`wal.Engine.Undo()` returns the engine's log. Its writes belong inside a transaction's `Write`, so that an uncommitted transaction's undo is discarded with its other changes.
 
 - **`Append`** sets `PrevInTxn` itself, from the segment's last record, so callers cannot get that chain wrong.
 - **`Read`** validates everything it decodes. A bad length, kind or pointer is `ErrCorrupt`, never a panic.
-- **Logging:** each write logs one WAL record, `Undo` (section 3.2). The record carries the bytes appended, or a page's initial header, or a "next page" link. As with heap pages, the first change to an undo page after a checkpoint logs its full image instead.
+- **Logging:** each write logs one WAL record, `Undo` (section 3.3). The record carries the bytes appended; or, when a new page is needed, the new page's image (holding the record) and the link to it from the segment's last page. As with heap pages, the first change to an undo page after a checkpoint logs its full image instead.
 
 ### 2.6 Records never span pages; the maximum row size
 
@@ -101,9 +104,25 @@ The alternative, records that continue across pages, costs a continuation format
 
 A record holds the row's whole previous image. A delta of only the changed columns would write less undo for wide rows with small updates, but it would need a column-delta format and decoding against the current row. The record's `Flags` byte is reserved for such a delta. Step 6.11 measures write amplification, and that measurement decides whether a delta is worth adding.
 
-## 3. Formats (approval needed)
+### 2.8 Implementation notes (Step 6.2)
 
-These are on-disk format changes. The phase's rules approve one only for Step 6.3, so **this one needs the maintainer's approval.**
+- **A new page is logged as an image holding its first record.** The design's separate "init" operation is gone.
+  - Growing a segment is one `Undo` record with two blocks: the link from the last page (or that page's image, if it is its first change since the redo point) and the new page's image. The two changes are atomic in the log.
+  - No undo page is ever empty, and recovery refuses one that is.
+  - The operations are numbered 1 image, 2 append, 3 set-next. An append carries its length, because a record may hold two blocks.
+- **The undo package takes a transaction ID as `uint64`, not `wal.XID`.** `wal` imports `undo` for replay, so `undo` cannot import `wal`. It has its own `Logger` interface (`LogUndo`, `LogUndoSegment`, `DeferFree`), which `wal.Logger` implements, as `storage` and `btree` already do.
+- **A segment's `add` is logged after its first page's image.** The other order, add first, could leave after a crash a table entry naming a page whose image never reached the log. Now a crash between the two leaks one page.
+- **A `drop` of a segment not in the table is ignored in replay, not refused.** A checkpoint's redo point is set first, and the table is logged again afterwards. A release logged in between is after the redo point, but the segment is already gone from the table the checkpoint logs. Replay from that redo point then sees the drop and no add before it. Inside the engine this cannot happen, since checkpoints wait for the writing transaction, but the undo log does not rely on that. A `drop` of a segment that *is* in the table must name its first page.
+- **Validation is complete on every read.** `Read` checks the whole page, not only the record it is asked for: every record must decode and belong to the page's transaction, the records must end exactly at `Used`, and the bytes after them must be zero. A pointer must land on a record boundary, so one into the middle of a record or an image is `ErrCorrupt`, even if the bytes there happen to look like a record.
+- **`ErrImageTooLarge`** is the error for an image over `MaxImage`. Other invalid records are `ErrInvalidRecord`. Neither logs anything.
+- **Deliberate bugs, as planned (section 7):** 33, run four at a time on copies of the code, each against its package's tests with a 60-second limit; the whole run took about 1.5 minutes.
+  - The first run caught 29.
+  - Three of the 4 survivors were test gaps: a too-long record length with bytes after it, an undo page labelled as another type, and a well-formed three-block record. New test cases now catch them.
+  - The fourth was a duplicate check. The image limit was checked both in decoding and in the shared field validation; decoding now relies on the shared one, and the bug is caught.
+
+## 3. Formats (approved)
+
+These are on-disk format changes. The phase's rules approve one only for Step 6.3; the maintainer approved this one, as written here with section 2.8's changes to `Undo` records.
 
 - **Data file format version 3:** page type 6 (undo). Files of version 2 are refused with the existing "unsupported format version" error. There is no production data to migrate.
 - **WAL format version 3:** record types 10 and 11 (section 3.2). Version-2 logs are refused, as before.
@@ -151,19 +170,22 @@ Header 54 bytes; the largest image that fits is 8144 − 54 = **8090** (`MaxImag
 
 ### 3.3 WAL records
 
-**Type 10, `Undo`:** one change to one undo page.
+**Type 10, `Undo`:** one change to one or two undo pages (section 2.8), in the heap record's block layout.
 
 ```
 offset  size   field
+0       1      BlockCount   1 or 2
+1       ...    blocks, back to back
+
+block:
 0       8      PageID
-8       1      Op           1 init, 2 append, 3 set-next, 4 image
-9       ...    init:      u64 XID
-               append:    u16 offset, then the record bytes
+8       1      Op           1 image, 2 append, 3 set-next
+9       ...    image:     8192 bytes
+               append:    u16 offset, u16 length, the record
                set-next:  u64 next page ID
-               image:     8192 bytes
 ```
 
-Redo applies it only if the page's LSN is older than the record's, as heap redo does.
+Redo installs an image whatever the page holds. It applies an append or a link only if the page's LSN is older than the record's, as heap redo does, and only if it fits exactly: an append must land at the page's `Used` and belong to the page's transaction, and a link must be the page's first.
 
 **Type 11, `UndoSegment`:** changes to the segment table.
 
@@ -173,7 +195,7 @@ offset  size   field
 2       ...    Count entries of 17 bytes: u8 op (1 add, 2 drop), u64 XID, u64 first page
 ```
 
-A checkpoint logs the table again with `add` entries, at most 400 to a record.
+A checkpoint logs the table again with `add` entries, at most 400 to a record. Replay applies the entries in order. An `add` of a segment already in the table must name the same first page. A `drop` of a segment not in the table is ignored (section 2.8). After replay, recovery follows each segment's pages to find its end, and refuses a page that is not an undo page of the segment's transaction, or one that appears twice.
 
 ## 4. Concurrency
 

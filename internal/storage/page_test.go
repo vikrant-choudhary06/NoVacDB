@@ -239,7 +239,7 @@ func TestWrongSizeBuffersRejectedEverywhere(t *testing.T) {
 }
 
 func TestInitPageRejectsInvalidType(t *testing.T) {
-	for _, typ := range []PageType{PageTypeInvalid, 6, 0xFFFF} {
+	for _, typ := range []PageType{PageTypeInvalid, 7, 0xFFFF} {
 		if err := InitPage(make([]byte, PageSize), Header{Type: typ}); !errors.Is(err, ErrBadPageType) {
 			t.Errorf("type %d err = %v", typ, err)
 		}
@@ -274,7 +274,7 @@ func TestPayloadAliasesPage(t *testing.T) {
 }
 
 func TestPageTypeValid(t *testing.T) {
-	for typ, want := range map[PageType]bool{0: false, 1: true, 2: true, 3: true, 4: true, 5: true, 6: false, 0xFFFF: false} {
+	for typ, want := range map[PageType]bool{0: false, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: false, 0xFFFF: false} {
 		if got := typ.Valid(); got != want {
 			t.Errorf("PageType(%d).Valid() = %v", typ, got)
 		}

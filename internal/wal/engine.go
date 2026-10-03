@@ -12,6 +12,7 @@ import (
 
 	"github.com/vikrant-choudhary06/NoVacDB/internal/btree"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/storage"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/undo"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/vfs"
 )
 
@@ -36,7 +37,7 @@ const defaultFrames = 256
 type RecoveryStats struct {
 	RedoLSN  LSN // where replay started
 	EndLSN   LSN // where the log ended
-	Replayed int // heap and B+Tree records replayed
+	Replayed int // heap, B+Tree and undo page records replayed
 	// Transactions that began but never committed, and their records,
 	// which recovery left out.
 	DiscardedTransactions int
@@ -46,6 +47,9 @@ type RecoveryStats struct {
 	// Entries of deferred-free records replayed (pages put back on the
 	// list to free).
 	DeferredFrees int
+	// UndoSegments is how many undo segments the segment table held after
+	// recovery.
+	UndoSegments int
 }
 
 // Engine is a database directory with crash recovery: a data file, its log,
@@ -61,6 +65,7 @@ type Engine struct {
 	bp   *storage.BufferPool
 	lg   *Logger
 	ck   *Checkpointer
+	undo *undo.Log
 	rec  RecoveryStats
 
 	mu     sync.Mutex
@@ -149,11 +154,19 @@ func (e *Engine) open(ctx context.Context, opts EngineOptions) error {
 	// The logger exists before replay so that replayed deferred-free
 	// records can put their pages back on its list.
 	e.lg = NewLogger(e.w, redo)
+	// So does the undo log, for replayed segment table records.
+	e.undo = undo.New(e.bp, e.lg)
 	if err := e.replay(ctx, walDir, redo); err != nil {
 		return err
 	}
+	// The undo pages are up to date: find where each segment ends.
+	if err := e.undo.Recover(ctx); err != nil {
+		return fmt.Errorf("recovery: %w: %w", ErrCorrupt, err)
+	}
+	e.rec.UndoSegments = len(e.undo.Segments())
 	e.ck = NewCheckpointer(e.fsys, e.dir, e.w, e.lg, e.bp, e.dm)
 	e.ck.nextXID = e.NextXID
+	e.ck.relogUndo = e.undo.Relog
 	// End-of-recovery checkpoint: the replayed pages reach disk and the
 	// next recovery starts here.
 	ctl, err := e.ck.Checkpoint(ctx)
@@ -225,7 +238,7 @@ func (e *Engine) uncommitted(walDir string, redo LSN) ([]span, error) {
 				return nil, fmt.Errorf("checkpoint record %d: %w", rec.LSN, ErrCorrupt)
 			}
 			next = max(next, XID(binary.LittleEndian.Uint64(rec.Payload[8:])))
-		case RecordHeap, RecordBTree, RecordDeferredFree:
+		case RecordHeap, RecordBTree, RecordDeferredFree, RecordUndo, RecordUndoSegment:
 		default:
 			// Checked here, not only in replay, so that a record of an
 			// unknown type (or of format version 1, or TxnAbort, reserved)
@@ -290,6 +303,15 @@ func (e *Engine) replay(ctx context.Context, walDir string, redo LSN) error {
 				return fmt.Errorf("replay: %w: %w", ErrCorrupt, err)
 			}
 			e.rec.Replayed++
+		case RecordUndo:
+			if err := undo.Redo(ctx, e.bp, uint64(rec.LSN), rec.Payload); err != nil {
+				return fmt.Errorf("replay: %w: %w", ErrCorrupt, err)
+			}
+			e.rec.Replayed++
+		case RecordUndoSegment:
+			if err := e.undo.RedoSegments(rec.Payload); err != nil {
+				return fmt.Errorf("replay: record %d: %w: %w", rec.LSN, ErrCorrupt, err)
+			}
 		case RecordDeferredFree:
 			// Pages waiting to be freed: back on the list.
 			frees, err := DecodeDeferredFree(rec.Payload, rec.LSN)
@@ -373,6 +395,11 @@ func (e *Engine) OpenBTree(ctx context.Context, root uint64) (*btree.Tree, error
 	}
 	return btree.Open(ctx, e.bp, root, btree.WithLogger(e.lg))
 }
+
+// Undo returns the engine's undo log. Its changes are logged like any
+// other; write it inside a transaction, so that an uncommitted
+// transaction's undo is discarded by recovery with its other changes.
+func (e *Engine) Undo() *undo.Log { return e.undo }
 
 // Logger returns the engine's logger.
 func (e *Engine) Logger() *Logger { return e.lg }

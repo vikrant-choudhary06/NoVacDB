@@ -42,6 +42,7 @@ const (
     PageTypeHeap          PageType = 3 // Step 1.4
     PageTypeBTreeInternal PageType = 4 // Step 3.1
     PageTypeBTreeLeaf     PageType = 5 // Step 3.1
+    PageTypeUndo          PageType = 6 // Step 6.2 (14-undo-log.md)
 )
 
 type Header struct {

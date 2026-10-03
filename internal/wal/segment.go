@@ -13,7 +13,7 @@ import (
 const SegmentHeaderSize = 32
 
 // FormatVersion is the log format version written by this code.
-const FormatVersion = 2
+const FormatVersion = 3
 
 // segMagic identifies a NoVacDB WAL segment.
 var segMagic = [8]byte{'N', 'O', 'V', 'A', 'W', 'A', 'L', 0}

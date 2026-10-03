@@ -24,8 +24,9 @@ const (
 	FirstDataPage = headerSlots
 	// FormatVersion is the on-disk format version written by this code.
 	// Version 2 added a Flags byte to B+Tree leaf cells
-	// (docs/design/08-btree.md, revision 2); version 1 files are refused.
-	FormatVersion = 2
+	// (docs/design/08-btree.md, revision 2); version 3 added undo pages
+	// (docs/design/14-undo-log.md). Other versions are refused.
+	FormatVersion = 3
 	// MaxPages is the largest page count for which every page offset fits
 	// in an int64.
 	MaxPages = uint64(math.MaxInt64 / PageSize)

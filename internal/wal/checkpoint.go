@@ -42,6 +42,9 @@ type Checkpointer struct {
 	// nextXID, if set (by the Engine), gives the next transaction ID the
 	// checkpoint record carries; without it the record carries 0.
 	nextXID func() XID
+	// relogUndo, if set (by the Engine), logs the undo segment table again
+	// after the redo point (docs/design/14-undo-log.md section 2.4).
+	relogUndo func(ctx context.Context) error
 }
 
 // NewCheckpointer returns a Checkpointer for the log w (with its Logger lg),
@@ -66,6 +69,13 @@ func (c *Checkpointer) Checkpoint(ctx context.Context) (Control, error) {
 	// are not: once its control file exists, nothing may name them again.
 	if err := c.relogWaiting(ctx, redo); err != nil {
 		return Control{}, fmt.Errorf("checkpoint: %w", err)
+	}
+	// Likewise the undo segment table, so that recovery from the redo
+	// point finds every segment.
+	if c.relogUndo != nil {
+		if err := c.relogUndo(ctx); err != nil {
+			return Control{}, fmt.Errorf("checkpoint: %w", err)
+		}
 	}
 	// 2. Write every page that was dirty before the redo point (forcing the
 	// log as needed), and 3. make the writes durable.

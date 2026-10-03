@@ -31,10 +31,16 @@ const (
 	// RecordTxnAbort is reserved for Step 6.5's rollback; nothing writes
 	// it yet, and recovery refuses it as an unknown type.
 	RecordTxnAbort RecordType = 9
+	// RecordUndo is a change to undo pages (undo.DecodeBlocks; format
+	// version 3, docs/design/14-undo-log.md).
+	RecordUndo RecordType = 10
+	// RecordUndoSegment changes the undo segment table
+	// (undo.DecodeSegmentEntries).
+	RecordUndoSegment RecordType = 11
 )
 
-// Logger connects heaps and B+Trees to the log (it implements
-// storage.Logger and btree.Logger) and holds
+// Logger connects heaps, B+Trees and the undo log to the log (it
+// implements storage.Logger, btree.Logger and undo.Logger) and holds
 // the redo point: the redo LSN of the latest checkpoint that has started. A
 // heap logs a full page image for the first change to a page after the redo
 // point, so recovery never needs a page's possibly torn copy on disk.
@@ -68,6 +74,18 @@ func (l *Logger) Log(ctx context.Context, build func(redoPoint uint64) []byte) (
 // LogBTree is Log for a B+Tree record.
 func (l *Logger) LogBTree(ctx context.Context, build func(redoPoint uint64) []byte) (uint64, error) {
 	return l.log(ctx, RecordBTree, build)
+}
+
+// LogUndo is Log for an undo page record.
+func (l *Logger) LogUndo(ctx context.Context, build func(redoPoint uint64) []byte) (uint64, error) {
+	return l.log(ctx, RecordUndo, build)
+}
+
+// LogUndoSegment appends an undo segment table record. An error means the
+// record may or may not reach the log.
+func (l *Logger) LogUndoSegment(ctx context.Context, payload []byte) (uint64, error) {
+	lsn, err := l.w.Append(ctx, RecordUndoSegment, payload)
+	return uint64(lsn), err
 }
 
 func (l *Logger) log(ctx context.Context, t RecordType, build func(redoPoint uint64) []byte) (uint64, error) {

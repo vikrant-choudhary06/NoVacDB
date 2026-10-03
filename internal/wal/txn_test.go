@@ -429,19 +429,20 @@ func TestAbandonedTxnStaysDiscarded(t *testing.T) {
 
 func TestMismatchedCommitIsCorrupt(t *testing.T) {
 	cases := map[string][][2]any{
-		"commit without begin":         {{RecordTxnCommit, uint64(1)}},
-		"commit of ID 0":               {{RecordTxnBegin, uint64(1)}, {RecordTxnCommit, uint64(0)}},
-		"commit of another ID":         {{RecordTxnBegin, uint64(1)}, {RecordTxnCommit, uint64(2)}},
-		"commit payload short":         {{RecordTxnBegin, uint64(1)}, {RecordTxnCommit, []byte{1}}},
-		"commit twice":                 {{RecordTxnBegin, uint64(1)}, {RecordTxnCommit, uint64(1)}, {RecordTxnCommit, uint64(1)}},
-		"begin of ID 0":                {{RecordTxnBegin, uint64(0)}},
-		"begin payload short":          {{RecordTxnBegin, []byte{1, 2}}},
-		"begin of a used ID":           {{RecordTxnBegin, uint64(5)}, {RecordTxnCommit, uint64(5)}, {RecordTxnBegin, uint64(5)}},
-		"IDs out of order":             {{RecordTxnBegin, uint64(5)}, {RecordTxnBegin, uint64(4)}},
-		"checkpoint payload short":     {{RecordCheckpoint, uint64(32)}},
-		"statement begin (version 1)":  {{RecordType(4), nil}},
-		"statement commit (version 1)": {{RecordType(5), uint64(32)}},
-		"abort (reserved)":             {{RecordTxnBegin, uint64(1)}, {RecordTxnAbort, uint64(1)}},
+		"commit without begin":          {{RecordTxnCommit, uint64(1)}},
+		"commit of ID 0":                {{RecordTxnBegin, uint64(1)}, {RecordTxnCommit, uint64(0)}},
+		"commit of another ID":          {{RecordTxnBegin, uint64(1)}, {RecordTxnCommit, uint64(2)}},
+		"commit payload short":          {{RecordTxnBegin, uint64(1)}, {RecordTxnCommit, []byte{1}}},
+		"commit twice":                  {{RecordTxnBegin, uint64(1)}, {RecordTxnCommit, uint64(1)}, {RecordTxnCommit, uint64(1)}},
+		"begin of ID 0":                 {{RecordTxnBegin, uint64(0)}},
+		"begin payload short":           {{RecordTxnBegin, []byte{1, 2}}},
+		"begin of a used ID":            {{RecordTxnBegin, uint64(5)}, {RecordTxnCommit, uint64(5)}, {RecordTxnBegin, uint64(5)}},
+		"IDs out of order":              {{RecordTxnBegin, uint64(5)}, {RecordTxnBegin, uint64(4)}},
+		"checkpoint payload short":      {{RecordCheckpoint, uint64(32)}},
+		"statement begin (version 1)":   {{RecordType(4), nil}},
+		"statement commit (version 1)":  {{RecordType(5), uint64(32)}},
+		"abort (reserved)":              {{RecordTxnBegin, uint64(1)}, {RecordTxnAbort, uint64(1)}},
+		"type 12, after the undo types": {{RecordTxnBegin, uint64(1)}, {RecordType(12), nil}},
 	}
 	for name, recs := range cases {
 		t.Run(name, func(t *testing.T) {

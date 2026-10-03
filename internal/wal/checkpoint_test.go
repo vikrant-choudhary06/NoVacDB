@@ -34,7 +34,7 @@ func TestControlRoundTripAndLayout(t *testing.T) {
 	enc := AppendControl(nil, Control{CheckpointLSN: 0x0102, RedoLSN: 0x0304})
 	want := make([]byte, ControlSize)
 	copy(want[4:], "NOVACTL\x00")
-	binary.LittleEndian.PutUint32(want[12:], 2) // format version 2 (Step 6.1)
+	binary.LittleEndian.PutUint32(want[12:], 3) // format version 3 (Step 6.2)
 	binary.LittleEndian.PutUint64(want[16:], 0x0102)
 	binary.LittleEndian.PutUint64(want[24:], 0x0304)
 	binary.LittleEndian.PutUint32(want, crc32c(want[4:]))
@@ -67,7 +67,8 @@ func TestDecodeControlRejects(t *testing.T) {
 		{"long", append(AppendControl(nil, Control{}), 0), ErrCorrupt},
 		{"zeros", make([]byte, ControlSize), ErrCorrupt},
 		{"magic", reseal(func(b []byte) { b[4] = 'X' }), ErrCorrupt},
-		{"future version", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 3) }), ErrUnsupportedVersion},
+		{"future version", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 4) }), ErrUnsupportedVersion},
+		{"version 2", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 2) }), ErrUnsupportedVersion},
 		{"version 1", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 1) }), ErrUnsupportedVersion},
 		{"redo after checkpoint", reseal(func(b []byte) { binary.LittleEndian.PutUint64(b[24:], 501) }), ErrCorrupt},
 	}
