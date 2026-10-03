@@ -22,3 +22,4 @@ Failure & crash, Alternatives, Testing plan, Limitations.
 | [11](11-sql-logic-tests.md) | SQL logic tests and the SQL crash workload (`tests/sqllogic`, `tests/crash`) | Implemented |
 | [12](12-wire-protocol.md) | PostgreSQL wire protocol (`internal/pgwire`, `internal/server`) | Implemented (Phase 5 complete) |
 | [13](13-transactions.md) | Transactions (`internal/wal`, `internal/sql/executor`) | Step 6.1 implemented |
+| [14](14-undo-log.md) | Undo log (`internal/undo`, `internal/wal`) | Step 6.2 designed, awaiting review |

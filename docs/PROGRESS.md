@@ -8,7 +8,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 
 ## Current step
 
-👉 **Step 6.2 — Undo log** (design doc `14-undo-log.md` comes first, for review)
+👉 **Step 6.2 — Undo log** (design doc `14-undo-log.md` awaiting review)
 
 ---
 
