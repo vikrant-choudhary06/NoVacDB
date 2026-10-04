@@ -280,6 +280,65 @@ Decided on 2026-10-04: the server is made Windows-native only once Phase 6 is co
 
 ---
 
+## Security (after Phase 6, with or right after Windows support)
+
+Decided on 2026-10-04: every connection must authenticate with a password. Today authentication is "trust" (anyone who can reach the port is in, `12-wire-protocol.md` section 2), which is why the server listens on `localhost` only. These steps replace that before NoVacDB is offered for use beyond one's own machine. Each step has its own design doc, reviewed before any code, and uses only the Go standard library (`crypto/...`).
+
+### ⬜ Step S.1 — Users and password authentication
+
+**Goal:** no connection without a valid user and password.
+
+**Scope:**
+- **SCRAM-SHA-256**, as in PostgreSQL: the password never crosses the network, and the server stores only a salted, iterated hash (never the password itself). `psql`, pgAdmin, drivers and NoVacDB Studio work unchanged.
+- **Users in the catalog:** `CREATE USER name PASSWORD '...'`, `ALTER USER ... PASSWORD`, `DROP USER`. Passwords never appear in logs or error messages.
+- **First start:** the server refuses to start without an initial superuser and password (given once, e.g. `novacdb init --user ...` with the password read from the terminal or a file, never from the command line).
+- **Password is the default everywhere.** Running without passwords ("trust") needs an explicit flag, is allowed only on `localhost`, and logs a warning at every start.
+- **Failed logins:** the same error whether the user exists or not; a delay after repeated failures from one address; every failure logged with its address.
+
+**Acceptance:** wrong password, unknown user and a missing password are all refused with PostgreSQL's error code (`28P01`); the stored hash verifies against PostgreSQL's own SCRAM test vectors; a fuzzed authentication exchange never crashes the server.
+
+---
+
+### ⬜ Step S.2 — Encrypted connections (TLS)
+
+**Goal:** nobody on the network can read or change what a client and the server exchange.
+
+**Scope:**
+- TLS on the PostgreSQL protocol (the `SSLRequest` that is declined today), with a certificate and key given to the server; `sslmode=require` and `verify-full` work from `psql`.
+- A setting to refuse connections without TLS from addresses other than `localhost` (the default once a certificate is configured).
+- Only TLS 1.2 and newer; the key file must not be readable by other users, or the server refuses to start.
+
+**Acceptance:** connections from `psql`, pgAdmin and Studio with `sslmode=verify-full`; a client asking for no TLS is refused when TLS is required; the handshake is fuzzed.
+
+---
+
+### ⬜ Step S.3 — Privileges
+
+**Goal:** a user can only do what they were allowed to do.
+
+**Scope:**
+- Superuser, and ordinary users who own the tables they create.
+- `GRANT` / `REVOKE` of `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables, and the right to create tables; checked on every statement (`42501` insufficient privilege, as PostgreSQL).
+- Only a superuser manages users.
+
+**Acceptance:** a model test of random grants, revokes and statements: every statement is allowed exactly when the model says so.
+
+---
+
+### ⬜ Step S.4 — Security review and hardening
+
+**Goal:** close what the earlier steps did not.
+
+**Scope:**
+- Limits that stop one client from taking the server down: connections per user and per address, maximum message and query size, statement timeout.
+- File permissions: the data directory and its files readable only by the server's user; refuse to start otherwise.
+- A written threat model (`docs/SECURITY.md`): what NoVacDB protects against, what it does not (for example, encryption of data files on disk), and how to report a vulnerability.
+- A full review of the protocol and authentication code, and long fuzzing runs of every message the server reads.
+
+**Acceptance:** the threat model's every claim has a test; fuzzing finds no crash; `SECURITY.md` published.
+
+---
+
 ## Later phases (detailed when we get there)
 
 - **Phase 7 — Planner:** joins, aggregates, `GROUP BY`, statistics, cost-based plan choice, plan hints
