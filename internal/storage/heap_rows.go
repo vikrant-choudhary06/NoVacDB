@@ -241,20 +241,32 @@ func (h *Heap) Insert(ctx context.Context, data []byte, stamp Stamper) (RID, err
 }
 
 // Get returns a copy of the current version of the row at rid, following
-// a forward stub.
+// a forward stub. A deleted row is ErrRowDeleted.
 func (h *Heap) Get(ctx context.Context, rid RID) (Version, error) {
+	v, err := h.GetVersion(ctx, rid)
+	if err == nil && v.Deleted {
+		return Version{}, fmt.Errorf("getting row %s: %w", rid, ErrRowDeleted)
+	}
+	return v, err
+}
+
+// GetVersion is Get that returns a deleted row's tombstone, as a version
+// with Deleted set, instead of ErrRowDeleted: a reader whose snapshot does
+// not see the delete follows its undo (docs/design/16-snapshots-
+// visibility.md section 2.2).
+func (h *Heap) GetVersion(ctx context.Context, rid RID) (Version, error) {
 	if err := h.checkRID(rid); err != nil {
 		return Version{}, err
 	}
 	for {
 		t, err := h.readTuple(ctx, rid)
-		if err == nil {
+		if err == nil && t.kind == tupleMoved {
 			err = homeKind(t, rid)
 		}
 		if err != nil {
 			return Version{}, fmt.Errorf("getting row %s: %w", rid, err)
 		}
-		if t.kind == tuplePlain {
+		if t.kind != tupleStub {
 			return t.version(), nil
 		}
 		at := t.link
@@ -507,13 +519,18 @@ func (h *Heap) delete(ctx context.Context, rid RID, s *stamped) error {
 // is followed. It holds no pin or latch between calls, and sees each page
 // as of the moment it visits it.
 type Scanner struct {
-	h    *Heap
-	page uint64 // current page, 0 when finished
-	slot int    // next slot to look at on that page
+	h       *Heap
+	page    uint64 // current page, 0 when finished
+	slot    int    // next slot to look at on that page
+	deleted bool   // return tombstones too
 }
 
 // Scan starts a scan at the first page.
 func (h *Heap) Scan() *Scanner { return &Scanner{h: h, page: h.first} }
+
+// ScanVersions is Scan that also returns deleted rows' tombstones, as
+// versions with Deleted set (see GetVersion).
+func (h *Heap) ScanVersions() *Scanner { return &Scanner{h: h, page: h.first, deleted: true} }
 
 // Next returns the next row's RID and current version (a copy). ok is
 // false at the end.
@@ -539,6 +556,11 @@ func (s *Scanner) Next(ctx context.Context) (rid RID, v Version, ok bool, err er
 					v = Version{RowHeader: t.hdr, Data: bytes.Clone(t.data)}
 					found = true
 					return false, nil
+				case tupleTombstone:
+					if s.deleted {
+						v, found = t.version(), true
+						return false, nil
+					}
 				case tupleStub:
 					forwarded = true
 					return false, nil
@@ -550,8 +572,8 @@ func (s *Scanner) Next(ctx context.Context) (rid RID, v Version, ok bool, err er
 		}
 		if forwarded {
 			// Read outside the page's latch, following the stub.
-			v, err = s.h.Get(ctx, rid)
-			if errors.Is(err, ErrRowDeleted) {
+			v, err = s.h.GetVersion(ctx, rid)
+			if err == nil && v.Deleted && !s.deleted {
 				continue // deleted since
 			}
 			if err != nil {

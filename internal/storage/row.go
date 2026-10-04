@@ -48,10 +48,13 @@ type RowHeader struct {
 	Undo uint64
 }
 
-// Version is one version of a row: its header and its encoded data.
+// Version is one version of a row: its header and its encoded data. A
+// deleted row's version (a tombstone, from GetVersion or ScanVersions) has
+// Deleted set, the deleter's header and no data.
 type Version struct {
 	RowHeader
-	Data []byte
+	Data    []byte
+	Deleted bool
 }
 
 // Stamper gives a write its header. It is called once per write, while the
@@ -81,7 +84,9 @@ func plainTuple(h RowHeader, data []byte) rowTuple {
 	return rowTuple{kind: tuplePlain, hdr: h, data: data}
 }
 
-func (t rowTuple) version() Version { return Version{RowHeader: t.hdr, Data: t.data} }
+func (t rowTuple) version() Version {
+	return Version{RowHeader: t.hdr, Data: t.data, Deleted: t.kind == tupleTombstone}
+}
 
 // encode returns the tuple's bytes.
 func (t rowTuple) encode() []byte {

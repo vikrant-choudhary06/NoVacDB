@@ -15,11 +15,13 @@ import (
 
 	"github.com/vikrant-choudhary06/NoVacDB/internal/btree"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/catalog"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/mvcc"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/ast"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/parser"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/sqlerr"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/types"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/storage"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/undo"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/vfs"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/wal"
 )
@@ -204,9 +206,15 @@ func (db *DB) run(ctx context.Context, tx *Tx, sql string, s ast.Stmt, ps *param
 	if err := ctx.Err(); err != nil {
 		return nil, canceled(err)
 	}
-	st := &stmt{db: db, tx: tx, ctx: ctx, sql: sql, ec: &evalCtx{now: types.TimestampFromTime(db.opts.Now())}, params: ps, describe: describe}
+	snap, err := db.snapshot(tx)
+	if err != nil {
+		return nil, err
+	}
+	if tx == nil || tx.isolation != RepeatableRead {
+		defer snap.Release()
+	}
+	st := &stmt{db: db, tx: tx, ctx: ctx, sql: sql, ec: &evalCtx{now: types.TimestampFromTime(db.opts.Now())}, params: ps, describe: describe, snap: snap}
 	var r *Result
-	var err error
 	switch s.(type) {
 	case *ast.CreateTable, *ast.DropTable, *ast.CreateIndex, *ast.DropIndex:
 		if describe {
@@ -255,7 +263,8 @@ func publicError(err error) *sqlerr.Error {
 
 func isCorruption(err error) bool {
 	for _, c := range []error{storage.ErrCorrupt, storage.ErrCorruptHeap, storage.ErrChecksum, storage.ErrBadPageType,
-		storage.ErrZeroPage, storage.ErrInvalidRID, btree.ErrCorruptNode, btree.ErrBadKey, wal.ErrCorrupt} {
+		storage.ErrZeroPage, storage.ErrInvalidRID, btree.ErrCorruptNode, btree.ErrBadKey, wal.ErrCorrupt,
+		undo.ErrCorrupt, mvcc.ErrCorrupt, mvcc.ErrBadImage} {
 		if errors.Is(err, c) {
 			return true
 		}
@@ -272,6 +281,59 @@ type stmt struct {
 	ec       *evalCtx
 	params   *params // nil for a statement without parameters
 	describe bool    // bind only: see run
+	// snap is what the statement sees: its own snapshot, or its
+	// REPEATABLE READ transaction's (docs/design/16-snapshots-
+	// visibility.md).
+	snap *wal.Snapshot
+}
+
+// snapshot returns the snapshot a statement of tx (nil: autocommit) reads
+// with: the transaction's for REPEATABLE READ, taken at its first
+// statement, else a new one. A REPEATABLE READ transaction whose snapshot
+// belongs to an engine since abandoned (a rollback or a restart reopened
+// the database) can no longer read consistently: 40001.
+func (db *DB) snapshot(tx *Tx) (*wal.Snapshot, error) {
+	if tx == nil || tx.isolation != RepeatableRead {
+		return db.e.Snapshot(), nil
+	}
+	if tx.snap == nil {
+		tx.snap = db.e.Snapshot()
+	} else if tx.snap.Engine() != db.e {
+		return nil, sqlerr.New(sqlerr.SerializationFailure, "could not serialize access: the database restarted during the transaction").
+			WithHint("Retry the transaction.")
+	}
+	return tx.snap, nil
+}
+
+// me returns the statement's transaction ID, 0 if it has not written.
+func (st *stmt) me() uint64 {
+	if st.tx != nil && st.tx.wtx != nil {
+		return uint64(st.tx.wtx.XID())
+	}
+	return 0
+}
+
+// reader reads row versions as the statement sees them.
+func (st *stmt) reader() mvcc.Reader {
+	return mvcc.Reader{Undo: st.db.e.Undo(), Snap: st.snap, Me: st.me()}
+}
+
+// writer writes rows of tbl in transaction xid. Under REPEATABLE READ it
+// checks that the rows it changes have not changed since the snapshot.
+func (st *stmt) writer(xid wal.XID, tableID uint64) mvcc.Writer {
+	w := mvcc.Writer{Undo: st.db.e.Undo(), XID: uint64(xid), Table: tableID}
+	if st.tx != nil && st.tx.isolation == RepeatableRead {
+		w.Snap = st.snap
+	}
+	return w
+}
+
+// indexesUsable reports whether the statement may read through indexes:
+// its snapshot sees every transaction that has written, so the indexes,
+// which describe the newest versions, describe what it sees (section 2.5).
+func (st *stmt) indexesUsable() bool {
+	last := uint64(st.db.e.LastWriter())
+	return last == 0 || last == st.me() || st.snap.Sees(last)
 }
 
 // binder returns a binder for the statement's expressions that see no
@@ -333,6 +395,15 @@ func (st *stmt) apply(ddl bool, fn func(ctx context.Context, xid wal.XID) error)
 			}
 		}
 		return se
+	case errors.Is(err, mvcc.ErrWriteConflict):
+		// REPEATABLE READ: the transaction cannot go on; its changes go
+		// as a rollback's do.
+		st.tx.discarded = true
+		if derr := db.discard(ctx, wtx); derr != nil {
+			return derr
+		}
+		return sqlerr.Wrap(err, sqlerr.SerializationFailure, "could not serialize access due to concurrent update").
+			WithHint("Retry the transaction.")
 	default:
 		if st.tx != nil {
 			st.tx.discarded = true
@@ -342,6 +413,9 @@ func (st *stmt) apply(ddl bool, fn func(ctx context.Context, xid wal.XID) error)
 	if st.tx != nil {
 		return nil
 	}
+	// The statement has finished reading: its snapshot must not hold back
+	// its own undo at commit (section 2.6).
+	st.snap.Release()
 	lsn, err := wtx.Commit(ctx)
 	if err != nil {
 		return db.restart(ctx, err, false)

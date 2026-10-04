@@ -61,6 +61,7 @@ const (
 	ObjectNotInPrerequisiteState = "55000"
 	InvalidTransactionState      = "25000"
 	InFailedSQLTransaction       = "25P02"
+	SerializationFailure         = "40001"
 	QueryCanceled                = "57014"
 	AdminShutdown                = "57P01"
 	CannotConnectNow             = "57P03"

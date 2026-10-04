@@ -30,6 +30,9 @@ type EngineOptions struct {
 	Frames int
 	// WAL configures the log.
 	WAL Options
+
+	// keepUndo: see Engine.keepUndo. Unexported: for this package's tests.
+	keepUndo bool
 }
 
 const (
@@ -89,8 +92,13 @@ type Engine struct {
 	// with a higher LSN were changed by it and must not reach disk yet.
 	horizon atomic.Uint64
 
-	// keepUndo turns off the interim release of a transaction's undo at
-	// commit (Txn.Commit), for this package's tests of the undo log itself.
+	// snaps are the live snapshots and lastWriter the most recent writing
+	// transaction (docs/design/16-snapshots-visibility.md), under mu.
+	snaps      map[*Snapshot]struct{}
+	lastWriter XID
+
+	// keepUndo turns off every release of undo (releaseUndo), for this
+	// package's tests of the undo log itself.
 	keepUndo bool
 }
 
@@ -106,7 +114,7 @@ func OpenEngine(ctx context.Context, fsys vfs.FS, dir string, opts EngineOptions
 	if opts.Frames < minFrames {
 		return nil, fmt.Errorf("opening engine: %d frames, need at least %d: %w", opts.Frames, minFrames, ErrInvalidOptions)
 	}
-	e := &Engine{fsys: fsys, dir: dir, nextXID: 1, active: map[XID]struct{}{}, outcomes: map[XID]outcome{}}
+	e := &Engine{fsys: fsys, dir: dir, nextXID: 1, active: map[XID]struct{}{}, outcomes: map[XID]outcome{}, keepUndo: opts.keepUndo}
 	if err := e.open(ctx, opts); err != nil {
 		// Report failures to close what was opened too, after the cause.
 		return nil, fmt.Errorf("opening engine %s: %w", dir, errors.Join(err, e.closeAll()))
@@ -172,6 +180,11 @@ func (e *Engine) open(ctx context.Context, opts EngineOptions) error {
 		return fmt.Errorf("recovery: %w: %w", ErrCorrupt, err)
 	}
 	e.rec.UndoSegments = len(e.undo.Segments())
+	// No snapshot survives a restart: every segment left belongs to a
+	// committed transaction nobody can read any more (section 2.6).
+	if err := e.releaseUndo(ctx, 0); err != nil {
+		return fmt.Errorf("recovery: releasing undo: %w", err)
+	}
 	e.ck = NewCheckpointer(e.fsys, e.dir, e.w, e.lg, e.bp, e.dm)
 	e.ck.nextXID = e.NextXID
 	e.ck.relogUndo = e.undo.Relog
@@ -432,6 +445,9 @@ func (e *Engine) Checkpoint(ctx context.Context) (Control, error) {
 	}
 	e.stmtMu.Lock()
 	defer e.stmtMu.Unlock()
+	if err := e.releaseUndo(ctx, 0); err != nil {
+		return Control{}, fmt.Errorf("checkpoint: releasing undo: %w", err)
+	}
 	ctl, err := e.ck.Checkpoint(ctx)
 	if err == nil {
 		e.pruneOutcomes(ctl.RedoLSN)
@@ -463,7 +479,10 @@ func (e *Engine) Close(ctx context.Context) error {
 		// A transaction is writing: closing normally would write its pages.
 		return errors.Join(fmt.Errorf("closing: %w", ErrTxnOpen), e.closeAll())
 	}
-	_, err := e.ck.Checkpoint(ctx)
+	err := e.releaseUndo(ctx, 0)
+	if err == nil {
+		_, err = e.ck.Checkpoint(ctx)
+	}
 	if err == nil {
 		err = e.bp.Close(ctx)
 	}

@@ -1,6 +1,6 @@
 # 16 — Snapshots and Visibility (`internal/wal`, `internal/mvcc`, `internal/storage`, `internal/sql/executor`)
 
-Status: **Step 6.4 designed; awaiting review.**
+Status: **Step 6.4 designed and approved. Implemented in two parts: 6.4a (snapshots, visibility, isolation levels, undo retention) is done; 6.4b (readers that do not wait for the writer) follows.** Notes in section 2.8.
 
 ## 1. Problem
 
@@ -129,6 +129,24 @@ The undo of a committed transaction `x` holds the versions from before `x`. A sn
   - snapshots per statement or per transaction, the locks of 2.4, and the index rule of 2.5;
   - `DB.Begin(ctx, TxOptions{Isolation})`, `READ COMMITTED` by default.
 - **The catalog** reads its system tables only when it opens, when no snapshot exists, through the same reader.
+
+### 2.8 Implementation notes
+
+**Step 6.4a** (everything but the locks of 2.4; readers still wait for a writing transaction):
+
+- **A snapshot does not carry `Me`.** A transaction's XID is allocated at its first write, which may come after its first snapshot (`REPEATABLE READ`). The reader's own XID is therefore passed separately (`mvcc.Reader.Me`, `stmt.me`), and is current at every statement.
+- **A snapshot is released before its own transaction's commit record.** An autocommit statement's snapshot, or a `REPEATABLE READ` transaction's, cannot see its own transaction. Still registered at commit, it held back that transaction's own undo until the next commit or checkpoint. A test of freed pages found this.
+- **The aborted transactions below `XMax`** (recovery's, from the status table) are copied into the snapshot when it is taken, so `Sees` needs no lock.
+- **Reads that return tombstones are new methods**, `Heap.GetVersion` and `Heap.ScanVersions`. `Get` and `Scan` keep their meaning for the catalog and the heap's own users.
+- **Loops in an undo chain** are looked for after 1024 steps, with the set of pointers followed. A long chain (one transaction changing a row many times) costs nothing before that.
+- **A write conflict discards the transaction** the way a rollback does (reopening, until Step 6.5), and returns `40001`.
+- **Deliberate bugs:** 22, in about a minute.
+  - **Caught at first: 18.**
+  - **Gaps found by the other 4, each caught after a new test:**
+    - a transaction updating its own new version must not conflict with itself;
+    - a `REPEATABLE READ` commit must release its own undo;
+    - an aborted transaction is never seen;
+    - an active transaction's undo is never released.
 
 ## 3. Formats
 

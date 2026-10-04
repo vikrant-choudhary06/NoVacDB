@@ -156,6 +156,7 @@ func (t *Txn) begin(ctx context.Context) error {
 	}
 	e.mu.Lock()
 	e.active[xid] = struct{}{}
+	e.lastWriter = xid
 	e.mu.Unlock()
 	t.xid = xid
 	e.horizon.Store(uint64(lsn))
@@ -163,8 +164,8 @@ func (t *Txn) begin(ctx context.Context) error {
 }
 
 // Commit commits the transaction and returns its commit record's LSN (0 for
-// a transaction that never wrote). It releases the transaction's undo
-// segment, logs TxnCommit and makes the log
+// a transaction that never wrote). It releases the undo no snapshot needs,
+// logs TxnCommit and makes the log
 // durable through it before returning. If that fails, the outcome is
 // unknown until recovery: the caller must abandon the engine.
 func (t *Txn) Commit(ctx context.Context) (LSN, error) {
@@ -179,13 +180,10 @@ func (t *Txn) Commit(ctx context.Context) (LSN, error) {
 		return 0, nil
 	}
 	e := t.e
-	// Interim rule (docs/design/15-row-versioning.md section 2.5): nothing
-	// reads old versions yet, so a committing transaction releases its
-	// undo, inside the transaction, before its commit record.
-	var err error
-	if !e.keepUndo && e.undo.Last(uint64(t.xid)) != 0 {
-		err = e.undo.Release(ctx, uint64(t.xid))
-	}
+	// Undo no snapshot needs any more, this transaction's included, is
+	// released inside it, before its commit record
+	// (docs/design/16-snapshots-visibility.md section 2.6).
+	err := e.releaseUndo(ctx, t.xid)
 	var lsn LSN
 	if err == nil {
 		lsn, err = e.w.Append(ctx, RecordTxnCommit, binary.LittleEndian.AppendUint64(nil, uint64(t.xid)))

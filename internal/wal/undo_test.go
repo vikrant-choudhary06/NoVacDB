@@ -105,9 +105,8 @@ func checkUndo(t *testing.T, e *Engine, want map[XID]writtenUndo, what string) {
 // as Step 6.4 will: these tests are about the undo log itself.
 func mustUndoEngine(t *testing.T, fsys vfs.FS, opts EngineOptions) *Engine {
 	t.Helper()
-	e := mustEngine(t, fsys, opts)
-	e.keepUndo = true
-	return e
+	opts.keepUndo = true
+	return mustEngine(t, fsys, opts)
 }
 
 // Committed transactions' undo survives power cuts, torn writes and

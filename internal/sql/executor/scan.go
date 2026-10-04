@@ -202,8 +202,13 @@ func startAfter(p []byte) btree.Bound {
 // if where is nil), reading it through a, until fn returns false.
 func (st *stmt) scan(tbl *catalog.Table, a access, where node, fn func(rid storage.RID, row []types.Value) (bool, error)) error {
 	colTypes := tbl.Types()
+	rd := st.reader()
 	n := 0
-	visit := func(rid storage.RID, data []byte) (bool, error) {
+	visit := func(rid storage.RID, v storage.Version) (bool, error) {
+		data, ok, err := rd.Visible(st.ctx, rid, v)
+		if err != nil || !ok {
+			return err == nil, err // a version the snapshot does not see
+		}
 		st.db.rowsRead.Add(1)
 		if n++; n%256 == 0 {
 			if err := st.ctx.Err(); err != nil {
@@ -226,13 +231,13 @@ func (st *stmt) scan(tbl *catalog.Table, a access, where node, fn func(rid stora
 		return fn(rid, row)
 	}
 	if a.ix == nil {
-		s := tbl.Heap.Scan()
+		s := tbl.Heap.ScanVersions()
 		for {
 			rid, v, ok, err := s.Next(st.ctx)
 			if err != nil || !ok {
 				return err
 			}
-			if more, err := visit(rid, v.Data); err != nil || !more {
+			if more, err := visit(rid, v); err != nil || !more {
 				return err
 			}
 		}
@@ -248,13 +253,13 @@ func (st *stmt) scan(tbl *catalog.Table, a access, where node, fn func(rid stora
 		if err != nil {
 			return err
 		}
-		// Index entries are removed with their row (until Step 6.7), so an
-		// entry never names a deleted row.
-		row, err := tbl.Heap.Get(st.ctx, rid)
+		// Indexes are used only when they describe what the snapshot sees
+		// (access); the visibility rule still decides each row.
+		row, err := tbl.Heap.GetVersion(st.ctx, rid)
 		if err != nil {
 			return err
 		}
-		if more, err := visit(rid, row.Data); err != nil || !more {
+		if more, err := visit(rid, row); err != nil || !more {
 			return err
 		}
 	}

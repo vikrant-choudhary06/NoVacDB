@@ -197,8 +197,7 @@ func (st *stmt) write(tbl *catalog.Table, changes []change) error {
 		return err
 	}
 	err := st.apply(false, func(ctx context.Context, xid wal.XID) error {
-		w := mvcc.Writer{Undo: st.db.e.Undo(), XID: uint64(xid), Table: uint64(tbl.ID)}
-		return applyChanges(ctx, w, tbl, changes)
+		return applyChanges(ctx, st.writer(xid, uint64(tbl.ID)), tbl, changes)
 	})
 	return err
 }
@@ -390,7 +389,7 @@ func (st *stmt) delete(s *ast.Delete) (*Result, error) {
 
 // access plans how to read tbl for a WHERE clause.
 func (st *stmt) access(tbl *catalog.Table, where node) access {
-	if st.db.noIndexScans {
+	if st.db.noIndexScans || !st.indexesUsable() {
 		return access{}
 	}
 	return plan(tbl, where)

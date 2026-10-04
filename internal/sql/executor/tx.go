@@ -20,8 +20,12 @@ import (
 // such a transaction would wait for the transaction itself; use the Tx's
 // methods.
 type Tx struct {
-	db  *DB
-	wtx *wal.Txn // nil until the first change
+	db        *DB
+	isolation IsolationLevel
+	// snap is a REPEATABLE READ transaction's snapshot, taken at its first
+	// statement (docs/design/16-snapshots-visibility.md section 2.3).
+	snap *wal.Snapshot
+	wtx  *wal.Txn // nil until the first change
 	// locked: the transaction holds db.mu exclusively.
 	locked bool
 	// failed: a statement failed; only Rollback (or Commit, which rolls
@@ -32,13 +36,48 @@ type Tx struct {
 	done      bool
 }
 
-// Begin starts a transaction. It takes no lock and no transaction ID until
-// its first change.
+// IsolationLevel is a transaction's isolation level
+// (docs/design/16-snapshots-visibility.md section 2.3).
+type IsolationLevel int
+
+// Isolation levels.
+const (
+	// ReadCommitted: each statement sees what was committed when it
+	// started (PostgreSQL's default).
+	ReadCommitted IsolationLevel = iota
+	// RepeatableRead: every statement sees what was committed when the
+	// transaction's first statement started. Changing a row changed since
+	// fails with 40001.
+	RepeatableRead
+)
+
+func (l IsolationLevel) String() string {
+	if l == RepeatableRead {
+		return "REPEATABLE READ"
+	}
+	return "READ COMMITTED"
+}
+
+// TxOptions configures a transaction.
+type TxOptions struct {
+	Isolation IsolationLevel
+}
+
+// Begin starts a READ COMMITTED transaction. It takes no lock and no
+// transaction ID until its first change.
 func (db *DB) Begin(ctx context.Context) (*Tx, error) {
+	return db.BeginTx(ctx, TxOptions{})
+}
+
+// BeginTx starts a transaction with the given options.
+func (db *DB) BeginTx(ctx context.Context, opts TxOptions) (*Tx, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, canceled(err)
 	}
-	return &Tx{db: db}, nil
+	if opts.Isolation != ReadCommitted && opts.Isolation != RepeatableRead {
+		return nil, sqlerr.New(sqlerr.InvalidParameterValue, "unknown isolation level %d", opts.Isolation)
+	}
+	return &Tx{db: db, isolation: opts.Isolation}, nil
 }
 
 func (tx *Tx) usable() error {
@@ -106,6 +145,12 @@ func (tx *Tx) Commit(ctx context.Context) error {
 		return nil
 	}
 	ctx = context.WithoutCancel(ctx)
+	// The snapshot must not hold back the transaction's own undo at commit
+	// (docs/design/16-snapshots-visibility.md section 2.6).
+	if tx.snap != nil {
+		tx.snap.Release()
+		tx.snap = nil
+	}
 	lsn, err := tx.wtx.Commit(ctx)
 	if err != nil {
 		// Outcome unknown until recovery decides it.
@@ -129,9 +174,14 @@ func (tx *Tx) Rollback(ctx context.Context) error {
 	return tx.db.discard(context.WithoutCancel(ctx), tx.wtx)
 }
 
-// end marks the transaction over and releases the lock it holds.
+// end marks the transaction over and releases its snapshot and the lock it
+// holds.
 func (tx *Tx) end() {
 	tx.done = true
+	if tx.snap != nil {
+		tx.snap.Release()
+		tx.snap = nil
+	}
 	if tx.locked {
 		tx.locked = false
 		tx.db.mu.Unlock()

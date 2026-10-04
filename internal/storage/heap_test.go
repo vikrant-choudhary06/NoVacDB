@@ -1460,3 +1460,60 @@ func TestPickPageExceptSkipsPages(t *testing.T) {
 		t.Fatalf("picked %d, %v; want %d", got, ok, ids[1])
 	}
 }
+
+// GetVersion and ScanVersions return deleted rows' tombstones with the
+// deleter's header, a moved row's included; Get and Scan skip them.
+func TestTombstoneReads(t *testing.T) {
+	_, h := newHeapEnv(t, 8)
+	plain, _ := h.put(bg, []byte("plain"))
+	moved, _ := h.put(bg, []byte("moved"))
+	kept, _ := h.put(bg, []byte("kept"))
+	h.fillPage(t, 0, 9)
+	if err := h.set(bg, moved, bytes.Repeat([]byte{7}, 3000)); err != nil {
+		t.Fatal(err)
+	}
+	if stub, _ := h.readTuple(bg, moved); stub.kind != tupleStub {
+		t.Fatal("setup: row did not move")
+	}
+	for i, rid := range []RID{plain, moved} {
+		if err := h.Delete(bg, rid, func(RID, *Version) (RowHeader, error) {
+			return RowHeader{XID: uint64(50 + i), Undo: uint64(900 + i)}, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, rid := range []RID{plain, moved} {
+		v, err := h.GetVersion(bg, rid)
+		if err != nil || !v.Deleted || v.XID != uint64(50+i) || v.Undo != uint64(900+i) || len(v.Data) != 0 {
+			t.Fatalf("GetVersion(%s) = %+v, %v", rid, v, err)
+		}
+		if _, err := h.Get(bg, rid); !errors.Is(err, ErrRowDeleted) {
+			t.Fatalf("Get(%s): %v", rid, err)
+		}
+	}
+	if v, err := h.GetVersion(bg, kept); err != nil || v.Deleted || string(v.Data) != "kept" {
+		t.Fatalf("GetVersion of a live row: %+v, %v", v, err)
+	}
+	all := map[RID]Version{}
+	s := h.ScanVersions()
+	for {
+		rid, v, ok, err := s.Next(bg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			break
+		}
+		if _, dup := all[rid]; dup {
+			t.Fatalf("ScanVersions returned %s twice", rid)
+		}
+		all[rid] = v
+	}
+	live := scanAll(t, h)
+	if len(all) != len(live)+2 || !all[plain].Deleted || !all[moved].Deleted || all[kept].Deleted {
+		t.Fatalf("ScanVersions: %d versions, Scan: %d rows", len(all), len(live))
+	}
+	if _, ok := live[plain]; ok {
+		t.Fatal("Scan returned a tombstone")
+	}
+}
