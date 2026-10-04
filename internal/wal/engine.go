@@ -242,12 +242,19 @@ func (e *Engine) uncommitted(walDir string, redo LSN) ([]span, error) {
 			}
 			open, openXID, last = rec.LSN, xid, xid
 			next = max(next, xid+1)
-		case RecordTxnCommit:
+		case RecordTxnCommit, RecordTxnAbort:
+			// A rolled-back transaction ended too: its records, and their
+			// reversal, are replayed like a committed one's
+			// (docs/design/17-rollback.md section 2.6).
 			xid, ok := decodeXID(rec.Payload)
 			if !ok || open == 0 || xid != openXID {
-				return nil, fmt.Errorf("transaction commit at %d does not match the open transaction: %w", rec.LSN, ErrCorrupt)
+				return nil, fmt.Errorf("transaction end (type %d) at %d does not match the open transaction: %w", rec.Type, rec.LSN, ErrCorrupt)
 			}
-			e.outcomes[xid] = outcome{TxnCommitted, rec.LSN}
+			status := TxnCommitted
+			if rec.Type == RecordTxnAbort {
+				status = TxnAborted
+			}
+			e.outcomes[xid] = outcome{status, rec.LSN}
 			open, openXID = 0, 0
 		case RecordCheckpoint:
 			// A checkpoint never runs inside a writing transaction: one
@@ -262,8 +269,8 @@ func (e *Engine) uncommitted(walDir string, redo LSN) ([]span, error) {
 		case RecordHeap, RecordBTree, RecordDeferredFree, RecordUndo, RecordUndoSegment:
 		default:
 			// Checked here, not only in replay, so that a record of an
-			// unknown type (or of format version 1, or TxnAbort, reserved)
-			// is refused even inside a transaction that replay skips.
+			// unknown type (or of format version 1) is refused even inside
+			// a transaction that replay skips.
 			return nil, fmt.Errorf("record %d has unknown type %d: %w", rec.LSN, rec.Type, ErrCorrupt)
 		}
 	}
@@ -347,7 +354,7 @@ func (e *Engine) replay(ctx context.Context, walDir string, redo LSN) error {
 				e.lg.restore(d.page, d.lsn)
 			}
 			e.rec.DeferredFrees += len(frees)
-		case RecordCheckpoint, RecordTxnBegin, RecordTxnCommit:
+		case RecordCheckpoint, RecordTxnBegin, RecordTxnCommit, RecordTxnAbort:
 			// Nothing to redo.
 		default:
 			return fmt.Errorf("replay: record %d has unknown type %d: %w", rec.LSN, rec.Type, ErrCorrupt)

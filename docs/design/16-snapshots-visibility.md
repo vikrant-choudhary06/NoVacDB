@@ -98,7 +98,7 @@ Today a writing transaction holds the executor's lock (`DB.mu`) exclusively unti
 - **Readers run beside one writer.** The heap, the B+Trees and the buffer pool already work under concurrent access, with page latches and their own concurrency tests. The undo log is read under shared page latches too; its first concurrent tests come with this step (section 7).
 - **Rows a writer moves or deletes stay readable** at their home RID (15-row-versioning.md section 2.2), so a scan sees each row once.
 - **Still one writer at a time** (the engine's writer slot, 13-transactions.md section 2.4). Step 6.6 allows more.
-- **A `REPEATABLE READ` transaction that lives across a reopen** (a rollback or a restart by another session) loses its snapshot. Its next statement fails with `40001`. The reopen goes away with Step 6.5.
+- **A `REPEATABLE READ` transaction that lives across a reopen** (a rollback or a restart by another session) loses its snapshot. Its next statement fails with `40001`. Since Step 6.5 a rollback uses undo and reopens nothing, except for transactions that changed the schema (17-rollback.md section 2.7).
 
 ### 2.5 Indexes until Step 6.7
 
@@ -144,7 +144,7 @@ The undo of a committed transaction `x` holds the versions from before `x`. A sn
 - **The aborted transactions below `XMax`** (recovery's, from the status table) are copied into the snapshot when it is taken, so `Sees` needs no lock.
 - **Reads that return tombstones are new methods**, `Heap.GetVersion` and `Heap.ScanVersions`. `Get` and `Scan` keep their meaning for the catalog and the heap's own users.
 - **Loops in an undo chain** are looked for after 1024 steps, with the set of pointers followed. A long chain (one transaction changing a row many times) costs nothing before that.
-- **A write conflict discards the transaction** the way a rollback does (reopening, until Step 6.5), and returns `40001`.
+- **A write conflict discards the transaction** the way a rollback does (reopening, until Step 6.5), and returns `40001`. Since Step 6.5 only the statement is undone, in place, and the transaction is failed (17-rollback.md section 2.5).
 - **Deliberate bugs:** 22, in about a minute.
   - **Caught at first: 18.**
   - **Gaps found by the other 4, each caught after a new test:**
@@ -232,6 +232,6 @@ Section 2.4, plus:
 
 - One writer at a time; a second writer waits for the first to end (6.6).
 - Readers skip indexes while a change they cannot see exists (2.5, until 6.7).
-- Rollback still reopens the database, ending `REPEATABLE READ` snapshots with `40001` (6.5).
+- Rollback still reopens the database, ending `REPEATABLE READ` snapshots with `40001` (6.5; done: 17-rollback.md).
 - A long snapshot holds undo back without limit (6.8).
 - Isolation levels are chosen through the executor's API only (`BEGIN ISOLATION LEVEL` is 6.10).

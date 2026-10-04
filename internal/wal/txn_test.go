@@ -241,15 +241,15 @@ func TestTxnPagesNeverReachDiskBeforeCommit(t *testing.T) {
 	if e.Pool().Stats().Writes == before {
 		t.Fatalf("no page was evicted during the transaction (%d rows, %+v): the test proves nothing", n, e.Pool().Stats())
 	}
-	// The transaction failed: it can only roll back, which abandons the
-	// engine; reopening discards it.
-	if err := tx.Write(bg, func(context.Context) error { return nil }); !errors.Is(err, ErrTxnFailed) {
+	// A change failed: the transaction can only roll back. Abandoning the
+	// engine and reopening it discards it.
+	if err := tx.Write(bg, func(context.Context) error { return nil }); !errors.Is(err, ErrTxnAborting) {
 		t.Fatalf("write after a failure: %v", err)
 	}
-	if _, err := tx.Commit(bg); !errors.Is(err, ErrTxnFailed) {
+	if _, err := tx.Commit(bg); !errors.Is(err, ErrTxnAborting) {
 		t.Fatalf("commit after a failure: %v", err)
 	}
-	if err := tx.Rollback(bg); err != nil {
+	if err := tx.Abandon(); err != nil {
 		t.Fatal(err)
 	}
 	e2 := mustEngine(t, m, EngineOptions{Frames: 12})
@@ -312,17 +312,17 @@ func TestTxnMisuse(t *testing.T) {
 	if _, err := ro.Commit(bg); !errors.Is(err, ErrTxnDone) {
 		t.Fatalf("commit twice: %v", err)
 	}
-	if err := ro.Rollback(bg); !errors.Is(err, ErrTxnDone) {
+	if err := ro.Rollback(bg, nil); !errors.Is(err, ErrTxnDone) {
 		t.Fatalf("rollback after commit: %v", err)
 	}
 	if err := ro.Write(bg, func(context.Context) error { return nil }); !errors.Is(err, ErrTxnDone) {
 		t.Fatalf("write after commit: %v", err)
 	}
 	rb := e.Begin()
-	if err := rb.Rollback(bg); err != nil {
+	if err := rb.Rollback(bg, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := rb.Rollback(bg); !errors.Is(err, ErrTxnDone) {
+	if err := rb.Rollback(bg, nil); !errors.Is(err, ErrTxnDone) {
 		t.Fatalf("rollback twice: %v", err)
 	}
 	if e.NextXID() != 1 {
@@ -342,7 +342,7 @@ func TestTxnMisuse(t *testing.T) {
 	if err := tx.Write(bg, func(context.Context) error { return sentinel }); !errors.Is(err, sentinel) {
 		t.Fatalf("failure: %v", err)
 	}
-	if err := tx.Write(bg, func(context.Context) error { return nil }); !errors.Is(err, ErrTxnFailed) {
+	if err := tx.Write(bg, func(context.Context) error { return nil }); !errors.Is(err, ErrTxnAborting) {
 		t.Fatalf("write after a failure: %v", err)
 	}
 	// Closing with a writing transaction open is refused, and closes the
@@ -402,8 +402,8 @@ func TestAbandonedTxnStaysDiscarded(t *testing.T) {
 	if err := e.w.Flush(bg); err != nil {
 		t.Fatal(err)
 	}
-	// Rollback of a transaction that wrote abandons the engine.
-	if err := tx.Rollback(bg); err != nil {
+	// Abandoning a transaction that wrote abandons the engine.
+	if err := tx.Abandon(); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.Abandon(); !errors.Is(err, ErrClosed) {
@@ -441,7 +441,11 @@ func TestMismatchedCommitIsCorrupt(t *testing.T) {
 		"checkpoint payload short":      {{RecordCheckpoint, uint64(32)}},
 		"statement begin (version 1)":   {{RecordType(4), nil}},
 		"statement commit (version 1)":  {{RecordType(5), uint64(32)}},
-		"abort (reserved)":              {{RecordTxnBegin, uint64(1)}, {RecordTxnAbort, uint64(1)}},
+		"abort without begin":           {{RecordTxnAbort, uint64(1)}},
+		"abort of another ID":           {{RecordTxnBegin, uint64(1)}, {RecordTxnAbort, uint64(2)}},
+		"abort payload short":           {{RecordTxnBegin, uint64(1)}, {RecordTxnAbort, []byte{1}}},
+		"abort after commit":            {{RecordTxnBegin, uint64(1)}, {RecordTxnCommit, uint64(1)}, {RecordTxnAbort, uint64(1)}},
+		"commit after abort":            {{RecordTxnBegin, uint64(1)}, {RecordTxnAbort, uint64(1)}, {RecordTxnCommit, uint64(1)}},
 		"type 12, after the undo types": {{RecordTxnBegin, uint64(1)}, {RecordType(12), nil}},
 	}
 	for name, recs := range cases {

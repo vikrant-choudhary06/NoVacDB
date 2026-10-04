@@ -189,7 +189,7 @@ The maximum encoded row drops from 8148 to **8000 bytes** (approved in Step 6.2)
 
 ## 8. Limitations (Step 6.3)
 
-- Nobody reads old versions yet (6.4); rollback still reopens the database (6.5).
+- Nobody reads old versions yet (6.4); rollback still reopens the database (6.5; done: 17-rollback.md).
 - Undo is released at commit (2.5), so there is no history across transactions until 6.4.
 - Tombstones stay until purge (6.8): 22 bytes per deleted row.
 - Index entries are still removed and added at once by the writer (6.7 changes this).

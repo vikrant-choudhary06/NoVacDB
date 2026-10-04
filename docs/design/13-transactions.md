@@ -205,7 +205,7 @@ The alternative that avoids a format change is a separate `NextXID` file written
 ## 8. Limitations (Step 6.1)
 
 - **One writing transaction at a time.** A writing transaction also blocks readers until it ends (section 2.6, until Steps 6.3–6.6).
-- **Rollback reopens the database** (until Step 6.5).
+- **Rollback reopens the database** (until Step 6.5; since then, only for transactions that changed the schema, 17-rollback.md).
 - **A transaction is bounded by the buffer pool, and checkpoints wait for it** (until Steps 6.2 and 6.9).
 - **No SQL syntax or wire support yet** (Step 6.10).
 - **`Status` gives exact outcomes only from the last checkpoint's redo point on.** Older IDs are "resolved" (section 2.3).

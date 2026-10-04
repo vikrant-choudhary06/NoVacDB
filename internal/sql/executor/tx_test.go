@@ -128,15 +128,20 @@ func TestTxRollback(t *testing.T) {
 		{"CREATE INDEX tv ON t (v)", "DELETE FROM t"},
 	} {
 		tx := mustBegin(t, db)
+		schema := false
 		for _, s := range stmts {
 			txExec(t, tx, s)
+			schema = schema || strings.HasPrefix(s, "CREATE") || strings.HasPrefix(s, "DROP")
 		}
-		rb := db.rollbacks.Load()
+		rb, dc := db.rollbacks.Load(), db.discards.Load()
 		if err := tx.Rollback(bg); err != nil {
 			t.Fatal(err)
 		}
-		if db.rollbacks.Load() != rb+1 {
-			t.Fatalf("%v: no rollback", stmts)
+		// With undo, unless the transaction changed the schema: then by
+		// reopening (docs/design/17-rollback.md section 2.7).
+		if schema && (db.rollbacks.Load() != rb || db.discards.Load() != dc+1) ||
+			!schema && (db.rollbacks.Load() != rb+1 || db.discards.Load() != dc) {
+			t.Fatalf("%v: %d rollbacks with undo, %d by reopening", stmts, db.rollbacks.Load()-rb, db.discards.Load()-dc)
 		}
 		if got := snapshot(t, db); got != before {
 			t.Fatalf("after rolling back %v:\n%s\nwant\n%s", stmts, got, before)
@@ -159,12 +164,12 @@ func TestTxRollback(t *testing.T) {
 	if got := rowsTx(t, tx, "SELECT v FROM t WHERE id = 2"); got != "b" {
 		t.Fatal(got)
 	}
-	rb := db.rollbacks.Load()
+	rb, dc := db.rollbacks.Load(), db.discards.Load()
 	if err := tx.Rollback(bg); err != nil {
 		t.Fatal(err)
 	}
-	if db.rollbacks.Load() != rb || db.e.NextXID() != next+5 {
-		t.Fatal("a read-only rollback reopened the database or took an ID")
+	if db.rollbacks.Load() != rb || db.discards.Load() != dc || db.e.NextXID() != next+5 {
+		t.Fatal("a read-only rollback rolled back or reopened anything, or took an ID")
 	}
 	// Commit of a read-only transaction takes no ID either.
 	tx = mustBegin(t, db)
@@ -239,6 +244,7 @@ func TestTxOutgrowsThePool(t *testing.T) {
 	mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, pad text)")
 	mustExec(t, db, "INSERT INTO t VALUES (0, 'committed')")
 	tx := mustBegin(t, db)
+	restarts, dc := db.restarts.Load(), db.discards.Load()
 	var err error
 	for i := 1; err == nil && i < 400; i++ {
 		_, err = tx.Exec(bg, fmt.Sprintf("INSERT INTO t VALUES (%d, '%s')", i, strings.Repeat("x", 2000)))
@@ -247,13 +253,20 @@ func TestTxOutgrowsThePool(t *testing.T) {
 	if !errors.As(err, &se) || se.Code != sqlerr.ProgramLimitExceeded || !strings.Contains(se.Message, "transaction") {
 		t.Fatalf("a transaction larger than the pool: %v", err)
 	}
-	// Already discarded by the restart; ending it reopens nothing more.
+	// The failed statement was undone in place (docs/design/17-rollback.md
+	// section 2.5); the transaction is failed, and rolls back with undo.
+	if db.undoneStatements.Load() == 0 {
+		t.Fatal("the failed statement was not undone")
+	}
+	if _, err := tx.Exec(bg, "SELECT 1"); sqlerr.Code(err) != sqlerr.InFailedSQLTransaction {
+		t.Fatalf("after the failed statement: %v", err)
+	}
 	rb := db.rollbacks.Load()
 	if err := tx.Rollback(bg); err != nil {
 		t.Fatal(err)
 	}
-	if db.rollbacks.Load() != rb {
-		t.Fatal("rolling back a discarded transaction reopened the database")
+	if db.rollbacks.Load() != rb+1 || db.restarts.Load() != restarts || db.discards.Load() != dc {
+		t.Fatalf("%d rollbacks with undo, %d restarts, %d reopens", db.rollbacks.Load()-rb, db.restarts.Load()-restarts, db.discards.Load()-dc)
 	}
 	if got := rows(t, db, "SELECT id, pad FROM t"); got != "0|committed" {
 		t.Fatalf("%q", got)

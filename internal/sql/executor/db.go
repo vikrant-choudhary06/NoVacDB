@@ -94,11 +94,14 @@ type DB struct {
 	// noIndexScans makes every scan sequential (tests compare the two).
 	noIndexScans     bool
 	indexScanHook    func()       // tests: runs as an index scan begins
+	changeHook       changeHook   // tests: may fail a statement partway
 	indexScans       atomic.Int64 // scans that used an index
 	indexScanRetries atomic.Int64 // index scans redone as table scans: a writer began during them
 	rowsRead         atomic.Int64 // rows scans have read, before WHERE
 	restarts         atomic.Int64 // self-restarts after failed statements
-	rollbacks        atomic.Int64 // rollbacks of transactions that wrote
+	rollbacks        atomic.Int64 // rollbacks with undo of transactions that wrote
+	discards         atomic.Int64 // rollbacks by reopening the database
+	undoneStatements atomic.Int64 // failed statements undone with undo
 }
 
 // Open opens the database in dir, creating it if it does not exist, and
@@ -415,9 +418,10 @@ func (st *stmt) indexesUsable() bool { return st.indexesShow(st.db.e.LastWriter(
 
 // indexesShow reports whether indexes describe the rows the statement sees
 // when last is the last writer: it is none, the statement's own
-// transaction, or one the snapshot sees.
+// transaction, or one that ended, committed or rolled back, before the
+// snapshot was taken (docs/design/17-rollback.md section 2.8).
 func (st *stmt) indexesShow(last wal.XID) bool {
-	return last == 0 || uint64(last) == st.me() || st.snap.Sees(uint64(last))
+	return last == 0 || uint64(last) == st.me() || st.snap.Ended(uint64(last))
 }
 
 // binder returns a binder for the statement's expressions that see no
@@ -425,14 +429,16 @@ func (st *stmt) indexesShow(last wal.XID) bool {
 func (st *stmt) binder() *binder { return &binder{sql: st.sql, params: st.params} }
 
 // tooMuch is the error for a statement, or a transaction, that changes
-// more pages than the buffer pool holds.
+// more pages than the buffer pool holds. In a transaction the statement
+// was undone, or the transaction discarded; either way it can only roll
+// back now.
 func (db *DB) tooMuch(err error, inTx bool) *sqlerr.Error {
 	if inTx {
 		return sqlerr.Wrap(err, sqlerr.ProgramLimitExceeded, "transaction changes too much data").
-			WithHint("A transaction can change at most %d pages (the buffer pool's size) until the undo log arrives; split it into smaller transactions. It was rolled back.", db.opts.Frames)
+			WithHint("A transaction can change at most %d pages (the buffer pool's size) until its pages may be written before it commits; split it into smaller transactions. It must be rolled back.", db.opts.Frames)
 	}
 	return sqlerr.Wrap(err, sqlerr.ProgramLimitExceeded, "statement changes too much data").
-		WithHint("A statement can change at most %d pages (the buffer pool's size) until the undo log arrives; split it into smaller statements.", db.opts.Frames)
+		WithHint("A statement can change at most %d pages (the buffer pool's size) until its pages may be written before it commits; split it into smaller statements.", db.opts.Frames)
 }
 
 // apply runs fn, the change phase of a statement, as a write of its
@@ -440,12 +446,14 @@ func (db *DB) tooMuch(err error, inTx bool) *sqlerr.Error {
 // transaction the transaction commits later. The caller holds the writer
 // slot and has already checked everything that can fail for SQL reasons.
 //
-// If anything fails once the transaction has begun writing, its changes
-// cannot be undone in memory: the database restarts itself (closing as a
-// crash would, then reopening, which discards the transaction) and returns
-// the error. With ddl set, a *sqlerr.Error from fn means fn changed
-// nothing (the catalog's rule), so the transaction goes on and the error
-// is returned.
+// If fn fails after changing data, leaving every page consistent, the
+// statement's changes are undone with undo (docs/design/17-rollback.md
+// section 2.5): in autocommit the transaction rolls back, in a transaction
+// it goes on, failed. Any other failure (I/O, logging, corruption), or a
+// failed undo, restarts the database (closing as a crash would, then
+// reopening, which discards the transaction) and returns the error. With
+// ddl set, a *sqlerr.Error from fn means fn changed nothing (the catalog's
+// rule), so the transaction goes on and the error is returned.
 //
 // Cancellation is not honoured from here on: a statement that has begun
 // changing data runs to its end.
@@ -461,6 +469,7 @@ func (st *stmt) apply(ddl bool, fn func(ctx context.Context, xid wal.XID) error)
 	} else {
 		wtx = db.e.Begin()
 	}
+	sp := wtx.Savepoint() // where the statement's undo begins
 	var se *sqlerr.Error
 	err := wtx.Write(ctx, func(ctx context.Context) error {
 		ferr := fn(ctx, wtx.XID())
@@ -478,15 +487,8 @@ func (st *stmt) apply(ddl bool, fn func(ctx context.Context, xid wal.XID) error)
 			}
 		}
 		return se
-	case errors.Is(err, mvcc.ErrWriteConflict):
-		// REPEATABLE READ: the transaction cannot go on; its changes go
-		// as a rollback's do.
-		st.tx.discarded = true
-		if derr := db.discard(ctx, wtx, st.held); derr != nil {
-			return derr
-		}
-		return sqlerr.Wrap(err, sqlerr.SerializationFailure, "could not serialize access due to concurrent update").
-			WithHint("Retry the transaction.")
+	case !ddl && pagesConsistent(err):
+		return st.undoStatement(ctx, wtx, sp, err)
 	default:
 		if st.tx != nil {
 			st.tx.discarded = true
@@ -521,22 +523,6 @@ func (db *DB) restart(ctx context.Context, cause error, inTx bool, h held) error
 		return db.tooMuch(cause, inTx)
 	}
 	return publicError(cause)
-}
-
-// discard rolls back a transaction that changed something: the engine is
-// abandoned and the database reopens, and recovery leaves it out (Step 6.1
-// has no undo: docs/design/13-transactions.md section 2.6).
-func (db *DB) discard(ctx context.Context, wtx *wal.Txn, h held) error {
-	db.log.Info("rolling back a transaction: reopening the database", "dir", db.dir, "xid", wtx.XID())
-	db.rollbacks.Add(1)
-	db.exclusively(h, func() {
-		_ = wtx.Rollback(ctx)
-		db.reopen(ctx)
-	})
-	if db.broken != nil {
-		return sqlerr.Wrap(db.broken, sqlerr.IOError, "the database is unavailable: reopening it after a rollback failed: %v", db.broken)
-	}
-	return nil
 }
 
 // reopen opens the database again after the engine was abandoned.

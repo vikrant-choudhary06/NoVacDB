@@ -28,8 +28,8 @@ const (
 	RecordTxnBegin RecordType = 7
 	// RecordTxnCommit commits a transaction; its payload is the XID.
 	RecordTxnCommit RecordType = 8
-	// RecordTxnAbort is reserved for Step 6.5's rollback; nothing writes
-	// it yet, and recovery refuses it as an unknown type.
+	// RecordTxnAbort ends a transaction that rolled back with undo
+	// (docs/design/17-rollback.md section 2.6). Payload: XID (u64).
 	RecordTxnAbort RecordType = 9
 	// RecordUndo is a change to undo pages (undo.DecodeBlocks; format
 	// version 3, docs/design/14-undo-log.md).

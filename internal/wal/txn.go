@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+
+	"github.com/vikrant-choudhary06/NoVacDB/internal/undo"
 )
 
 // XID is a transaction ID (docs/design/13-transactions.md section 2.1):
@@ -53,9 +55,12 @@ func (s TxnStatus) String() string {
 var (
 	// ErrTxnDone means the transaction already committed or rolled back.
 	ErrTxnDone = errors.New("wal: transaction already ended")
-	// ErrTxnFailed means a change of the transaction failed: it can only
-	// roll back.
-	ErrTxnFailed = errors.New("wal: transaction failed; it can only roll back")
+	// ErrTxnFailed means logging for the transaction, or its rollback,
+	// failed: it can only be abandoned (Abandon).
+	ErrTxnFailed = errors.New("wal: transaction failed; it can only be abandoned")
+	// ErrTxnAborting means a change of the transaction failed: it can only
+	// roll back (RollbackTo or Rollback).
+	ErrTxnAborting = errors.New("wal: a change of the transaction failed; it can only roll back")
 	// ErrXIDExhausted means every transaction ID has been used.
 	ErrXIDExhausted = errors.New("wal: transaction IDs exhausted")
 	// ErrTxnOpen means the engine was closed while a transaction was
@@ -73,6 +78,10 @@ type txnState int
 
 const (
 	txnOpen txnState = iota
+	// txnAborting: a change failed, leaving every page consistent; only
+	// a rollback may follow (docs/design/17-rollback.md section 2.4).
+	txnAborting
+	// txnFailed: logging, or a rollback, failed; only Abandon is left.
 	txnFailed
 	txnCommitted
 	txnRolledBack
@@ -106,14 +115,11 @@ func Unchanged(err error) error { return &unchangedError{err} }
 // Write runs fn, one change, as part of the transaction. On the first
 // Write the transaction waits for the engine's writer slot, takes its ID
 // and logs TxnBegin; the pages it changes cannot reach disk until it
-// commits. If fn fails (unless with Unchanged) or logging fails, the
-// transaction is failed and can only roll back.
+// commits. If fn fails (unless with Unchanged), the transaction can only
+// roll back; if logging TxnBegin fails, it can only be abandoned.
 func (t *Txn) Write(ctx context.Context, fn func(ctx context.Context) error) error {
-	switch t.state {
-	case txnFailed:
-		return ErrTxnFailed
-	case txnCommitted, txnRolledBack:
-		return ErrTxnDone
+	if err := t.usable(); err != nil {
+		return err
 	}
 	if t.xid == 0 {
 		if err := t.begin(ctx); err != nil {
@@ -128,8 +134,21 @@ func (t *Txn) Write(ctx context.Context, fn func(ctx context.Context) error) err
 	case errors.As(err, &u):
 		return u.err
 	}
-	t.state = txnFailed
+	t.state = txnAborting
 	return err
+}
+
+// usable checks that the transaction may change data or commit.
+func (t *Txn) usable() error {
+	switch t.state {
+	case txnAborting:
+		return ErrTxnAborting
+	case txnFailed:
+		return ErrTxnFailed
+	case txnCommitted, txnRolledBack:
+		return ErrTxnDone
+	}
+	return nil
 }
 
 // begin takes the writer slot, allocates the ID and logs TxnBegin.
@@ -171,11 +190,8 @@ func (t *Txn) begin(ctx context.Context) error {
 // recovery; if releasing fails, the transaction has committed (the LSN is
 // returned with the error). Either way the caller must abandon the engine.
 func (t *Txn) Commit(ctx context.Context) (LSN, error) {
-	switch t.state {
-	case txnFailed:
-		return 0, ErrTxnFailed
-	case txnCommitted, txnRolledBack:
-		return 0, ErrTxnDone
+	if err := t.usable(); err != nil {
+		return 0, err
 	}
 	if t.xid == 0 {
 		t.state = txnCommitted
@@ -209,11 +225,104 @@ func (t *Txn) Commit(ctx context.Context) (LSN, error) {
 	return lsn, nil
 }
 
-// Rollback ends the transaction without its changes. A transaction that
-// never wrote just ends. One that wrote is discarded the only way Step 6.1
-// has (section 2.6): the engine is abandoned as a crash would leave it, and
-// the caller must reopen it, when recovery discards the transaction.
-func (t *Txn) Rollback(ctx context.Context) error {
+// Savepoint returns where the transaction's undo ends now: its latest
+// undo record, 0 if none (docs/design/17-rollback.md section 2.4).
+func (t *Txn) Savepoint() undo.Ptr {
+	if t.xid == 0 {
+		return 0
+	}
+	return t.e.undo.Last(uint64(t.xid))
+}
+
+// Undoer reverses a transaction's undo records from from, its latest, back
+// to, but not including, to (mvcc.Undo walks them).
+type Undoer func(ctx context.Context, from, to undo.Ptr) error
+
+// RollbackTo undoes the transaction's changes after savepoint sp with fn,
+// as a write of the transaction, after which its undo ends at sp again and
+// it may go on. If fn fails, the transaction can only be abandoned
+// (section 2.5).
+func (t *Txn) RollbackTo(ctx context.Context, sp undo.Ptr, fn Undoer) error {
+	switch t.state {
+	case txnFailed:
+		return ErrTxnFailed
+	case txnCommitted, txnRolledBack:
+		return ErrTxnDone
+	}
+	if err := t.undo(ctx, sp, fn); err != nil {
+		return err
+	}
+	t.state = txnOpen
+	return nil
+}
+
+// undo runs fn back to sp and rewinds the undo to it; on failure the
+// transaction is failed.
+func (t *Txn) undo(ctx context.Context, sp undo.Ptr, fn Undoer) error {
+	from := t.Savepoint()
+	if from == sp {
+		return nil
+	}
+	err := fn(ctx, from, sp)
+	if err == nil {
+		err = t.e.undo.Rewind(ctx, uint64(t.xid), sp)
+	}
+	if err != nil {
+		t.state = txnFailed
+		return fmt.Errorf("rolling back transaction %d: %w", t.xid, err)
+	}
+	return nil
+}
+
+// Rollback ends the transaction without its changes (section 2.6). A
+// transaction that never wrote just ends. Otherwise fn undoes all its
+// changes, as a write of the transaction; then TxnAbort is logged and made
+// durable, the transaction ends as aborted, and its undo is released once
+// no snapshot can need it. If any of that fails, the transaction can only
+// be abandoned (Abandon), and recovery discards it.
+func (t *Txn) Rollback(ctx context.Context, fn Undoer) error {
+	switch t.state {
+	case txnFailed:
+		return ErrTxnFailed
+	case txnCommitted, txnRolledBack:
+		return ErrTxnDone
+	}
+	if t.xid == 0 {
+		t.state = txnRolledBack
+		return nil
+	}
+	if err := t.undo(ctx, 0, fn); err != nil {
+		return err
+	}
+	e := t.e
+	lsn, err := e.w.Append(ctx, RecordTxnAbort, binary.LittleEndian.AppendUint64(nil, uint64(t.xid)))
+	if err == nil {
+		// Durable before any page of the transaction may reach disk.
+		err = e.w.FlushTo(ctx, lsn)
+	}
+	if err != nil {
+		t.state = txnFailed
+		return fmt.Errorf("rolling back transaction %d: %w", t.xid, err)
+	}
+	e.mu.Lock()
+	delete(e.active, t.xid)
+	e.outcomes[t.xid] = outcome{TxnAborted, lsn}
+	e.mu.Unlock()
+	t.state = txnRolledBack
+	e.horizon.Store(0)
+	if err := e.releaseUndo(ctx); err != nil {
+		return fmt.Errorf("transaction %d rolled back; releasing undo: %w", t.xid, err)
+	}
+	e.stmtMu.Unlock()
+	return nil
+}
+
+// Abandon ends the transaction the way Step 6.1 rolled back: a transaction
+// that wrote leaves the engine abandoned, as a crash would, and the caller
+// must reopen it; recovery discards the transaction. It is the way out of
+// a failed transaction, or one whose rollback cannot be done (a schema
+// change, docs/design/17-rollback.md section 2.7).
+func (t *Txn) Abandon() error {
 	switch t.state {
 	case txnCommitted, txnRolledBack:
 		return ErrTxnDone

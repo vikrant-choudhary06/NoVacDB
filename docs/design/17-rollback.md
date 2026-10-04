@@ -1,6 +1,6 @@
 # 17 — Rollback (`internal/storage`, `internal/mvcc`, `internal/wal`, `internal/sql/executor`)
 
-Status: **Step 6.5 designed, awaiting review.** The decision points to approve are in section 9.
+Status: **Step 6.5 designed, approved (all five decision points of section 9, as proposed) and implemented.** Implementation notes in section 2.9.
 
 ## 1. Problem
 
@@ -203,6 +203,28 @@ The executor knows which transactions ran DDL (`Tx.locked`). If the undo walk ev
 - A rolled-back transaction's outcome is *aborted*, and snapshots copy it as they copy recovery's aborted transactions today.
 - Once a checkpoint prunes it to *resolved*, a snapshot "sees" it. That is harmless: none of its changes remain (13-transactions.md section 2.3).
 
+### 2.9 Implementation notes (Step 6.5)
+
+- **`wal.Txn` has two failure states.**
+  - *Aborting:* a change failed, with every page consistent. Only `RollbackTo` and `Rollback` are allowed (`ErrTxnAborting` otherwise).
+  - *Failed:* logging, or a rollback, failed. Only `Abandon` is left (`ErrTxnFailed`).
+  - `Abandon` is Step 6.1's rollback (abandon the engine and reopen), kept for the cases of 2.5 and 2.7.
+- **The `Undoer` gets both ends of the walk**, `(from, to)`: `RollbackTo` and `Rollback` give it the transaction's latest record and the savepoint (0 for all).
+- **`undo.Log.Rewind`** sets a segment's latest record back to the savepoint, in memory, after a `RollbackTo`, so the next record follows it (2.4). It checks that the savepoint is a record of the transaction.
+- **`mvcc.Revert` checks the row before changing it.** The row's current version must be the transaction's, name exactly the record being reversed (its undo pointer), and be a tombstone exactly when the record is a delete. Anything else is `ErrCorrupt`, and the database restarts. A test reverts records out of order and is refused.
+- **`Heap.Restore` and `Heap.Remove`** reuse the update and delete paths. A flag lets the update path accept a tombstone at home, which a restore replaces, moving the row if the version does not fit.
+- **Snapshots gained `Ended(xid)`**: below `XMax` and not active. Both the undo release rule and the index rule (2.8) use it.
+- **The executor counts** rollbacks with undo, rollbacks by reopening (`discards`) and undone statements, so tests can tell which path ran.
+- **A test hook fails a statement at any point of its changes:** after a row is written, after its old index entries go, after its new ones are added. The first plan, an index key too long, did not work: `checkRow` checks key sizes before any change, so those statements failed before changing anything. The hook makes the acceptance test exercise every partial state of 2.2.
+- **`TestRestartWhileReading`** (6.4b) needed a restart while readers run. A statement too large for the pool no longer restarts the database; it is undone in place. An injected I/O failure at commit now triggers the restart.
+- **The hint for `54000`** no longer says "until the undo log arrives". The limit stays until pages of open transactions may be written ("steal", 6.9), and a failed transaction must now be rolled back.
+- **Deliberate bugs:** 28, four at a time, about 4 minutes.
+  - **Caught at first:** 25.
+  - **Caught after new tests:** 3.
+    - Closing the engine right after a rollback (the "no steal" horizon must be cleared).
+    - A transaction that goes on after `RollbackTo`.
+    - A `REPEATABLE READ` transaction's own snapshot must not hold back its undo at rollback.
+
 ## 3. Formats
 
 **No on-disk format change.**
@@ -289,7 +311,7 @@ The executor knows which transactions ran DDL (`Tx.locked`). If the undo walk ev
 - **No savepoints in SQL** (6.10). The mechanism (2.4, 2.5) is the one they will use.
 - **Page layout after a rollback may differ from before** (B+Tree splits stay, a moved row may sit on another page). The data and every version chain are identical.
 
-## 9. Decision points for review
+## 9. Decision points (approved as proposed)
 
 1. **What "byte-identical" means (acceptance).** Proposed: after a rollback, every row's version (RID, flags, XID, undo pointer, data bytes) and every index's full contents are identical. Raw page bytes are not: slot positions, free space, B+Tree splits and page LSNs may differ, as in PostgreSQL and InnoDB.
 2. **WAL format version.** Proposed: **no change.** `TxnAbort` was already approved as type 9 in version 2, and existing databases (including your demo data) keep opening. The alternative raises the WAL version to 5: older builds would then report "unsupported version" instead of "corrupt" on a new log, and 6.4 logs would be refused.

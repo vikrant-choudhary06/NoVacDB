@@ -316,13 +316,14 @@ func (s *stamped) get(rid RID, old Version) (RowHeader, error) {
 	return hdr, nil
 }
 
-// locate reads the home slot and, for a moved row, where it is now.
-func (h *Heap) locate(ctx context.Context, rid RID) (rowTuple, error) {
+// locate reads the home slot and, for a moved row, where it is now. A
+// tombstone is ErrRowDeleted unless tombstones is set.
+func (h *Heap) locate(ctx context.Context, rid RID, tombstones bool) (rowTuple, error) {
 	if err := h.checkRID(rid); err != nil {
 		return rowTuple{}, err
 	}
 	t, err := h.readTuple(ctx, rid)
-	if err == nil {
+	if err == nil && (t.kind != tupleTombstone || !tombstones) {
 		err = homeKind(t, rid)
 	}
 	if err == nil && t.kind == tupleStub {
@@ -335,17 +336,17 @@ func (h *Heap) locate(ctx context.Context, rid RID) (rowTuple, error) {
 
 // current returns, from latched pages, the row's current version. It fails
 // with errRetry if the home slot no longer forwards to want (0: not
-// forwarded).
-func current(e *edit, rid RID, want RID) (Version, error) {
+// forwarded). A tombstone is ErrRowDeleted unless tombstones is set.
+func current(e *edit, rid RID, want RID, tombstones bool) (Version, error) {
 	home, err := tupleAt(e.sps[rid.Page], rid)
-	if err == nil {
+	if err == nil && (home.kind != tupleTombstone || !tombstones) {
 		err = homeKind(home, rid)
 	}
 	if err != nil {
 		return Version{}, err
 	}
 	switch {
-	case home.kind == tuplePlain && want == (RID{}):
+	case (home.kind == tuplePlain || home.kind == tupleTombstone) && want == (RID{}):
 		return home.version(), nil
 	case home.kind == tupleStub && home.link == want:
 		sp, ok := e.sps[want.Page]
@@ -370,7 +371,7 @@ func (h *Heap) Update(ctx context.Context, rid RID, data []byte, stamp Stamper) 
 	}
 	s := &stamped{stamp: stamp}
 	for {
-		err := h.update(ctx, rid, data, s)
+		err := h.update(ctx, rid, data, s, false)
 		if errors.Is(err, errRetry) {
 			continue
 		}
@@ -381,8 +382,10 @@ func (h *Heap) Update(ctx context.Context, rid RID, data []byte, stamp Stamper) 
 	}
 }
 
-func (h *Heap) update(ctx context.Context, rid RID, data []byte, s *stamped) error {
-	home, err := h.locate(ctx, rid)
+// update writes the new version; with restore set, the row may be a
+// tombstone, which the new version replaces.
+func (h *Heap) update(ctx context.Context, rid RID, data []byte, s *stamped, restore bool) error {
+	home, err := h.locate(ctx, rid, restore)
 	if err != nil {
 		return err
 	}
@@ -396,7 +399,7 @@ func (h *Heap) update(ctx context.Context, rid RID, data []byte, s *stamped) err
 	// it moved to.
 	moved := false
 	err = h.withPages(ctx, pages, func(e *edit) error {
-		old, err := current(e, rid, at)
+		old, err := current(e, rid, at, restore)
 		if err != nil {
 			return err
 		}
@@ -422,13 +425,13 @@ func (h *Heap) update(ctx context.Context, rid RID, data []byte, s *stamped) err
 	if err != nil || !moved {
 		return err
 	}
-	return h.moveRow(ctx, rid, at, data, s)
+	return h.moveRow(ctx, rid, at, data, s, restore)
 }
 
 // moveRow moves the row at rid (now at its home, or at at) to a page with
 // room: the moved-in tuple, the home stub and the removal of the old
 // moved-in tuple are one record.
-func (h *Heap) moveRow(ctx context.Context, rid, at RID, data []byte, s *stamped) error {
+func (h *Heap) moveRow(ctx context.Context, rid, at RID, data []byte, s *stamped, restore bool) error {
 	t := rowTuple{kind: tupleMoved, link: rid, data: data}
 	skip := []uint64{rid.Page}
 	if at != (RID{}) {
@@ -442,7 +445,7 @@ func (h *Heap) moveRow(ctx context.Context, rid, at RID, data []byte, s *stamped
 		return errRetry
 	}
 	return h.withPages(ctx, append(slices.Clone(skip), target), func(e *edit) error {
-		old, err := current(e, rid, at)
+		old, err := current(e, rid, at, restore)
 		if err != nil {
 			return err
 		}
@@ -487,7 +490,7 @@ func (h *Heap) Delete(ctx context.Context, rid RID, stamp Stamper) error {
 }
 
 func (h *Heap) delete(ctx context.Context, rid RID, s *stamped) error {
-	home, err := h.locate(ctx, rid)
+	home, err := h.locate(ctx, rid, false)
 	if err != nil {
 		return err
 	}
@@ -498,7 +501,7 @@ func (h *Heap) delete(ctx context.Context, rid RID, s *stamped) error {
 		pages = append(pages, at.Page)
 	}
 	return h.withPages(ctx, pages, func(e *edit) error {
-		old, err := current(e, rid, at)
+		old, err := current(e, rid, at, false)
 		if err != nil {
 			return err
 		}
@@ -507,6 +510,70 @@ func (h *Heap) delete(ctx context.Context, rid RID, s *stamped) error {
 			return err
 		}
 		err = e.update(rid, rowTuple{kind: tupleTombstone, hdr: hdr})
+		if err == nil && at != (RID{}) {
+			err = e.delete(at)
+		}
+		return e.finish(ctx, err)
+	})
+}
+
+// Restore writes version v at rid, whatever the row's current version (a
+// row, possibly moved, or a tombstone), moving the row as Update does: a
+// rollback puts back the version a change replaced
+// (docs/design/17-rollback.md section 2.3). v must not be deleted.
+func (h *Heap) Restore(ctx context.Context, rid RID, v Version) error {
+	if v.Deleted {
+		return fmt.Errorf("restoring row %s: a tombstone: %w", rid, ErrInvalidVersion)
+	}
+	if err := checkRowData(v.Data); err != nil {
+		return err
+	}
+	s := &stamped{stamp: func(RID, *Version) (RowHeader, error) { return v.RowHeader, nil }}
+	for {
+		err := h.update(ctx, rid, v.Data, s, true)
+		if errors.Is(err, errRetry) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("restoring row %s: %w", rid, err)
+		}
+		return nil
+	}
+}
+
+// Remove removes the row at rid entirely: its home slot, which becomes
+// free, and the moved-in tuple it forwards to. A rollback removes a row it
+// inserted this way (docs/design/17-rollback.md section 2.3). A deleted
+// row is ErrRowDeleted.
+func (h *Heap) Remove(ctx context.Context, rid RID) error {
+	for {
+		err := h.remove(ctx, rid)
+		if errors.Is(err, errRetry) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("removing row %s: %w", rid, err)
+		}
+		return nil
+	}
+}
+
+func (h *Heap) remove(ctx context.Context, rid RID) error {
+	home, err := h.locate(ctx, rid, false)
+	if err != nil {
+		return err
+	}
+	var at RID
+	pages := []uint64{rid.Page}
+	if home.kind == tupleStub {
+		at = home.link
+		pages = append(pages, at.Page)
+	}
+	return h.withPages(ctx, pages, func(e *edit) error {
+		if _, err := current(e, rid, at, false); err != nil {
+			return err
+		}
+		err := e.delete(rid)
 		if err == nil && at != (RID{}) {
 			err = e.delete(at)
 		}

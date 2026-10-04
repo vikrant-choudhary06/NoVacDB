@@ -67,6 +67,19 @@ func (s *Snapshot) Sees(xid uint64) bool {
 	return !active
 }
 
+// Ended reports whether transaction xid had ended, committed or rolled
+// back, when the snapshot was taken: it is below XMax and was not active
+// (docs/design/17-rollback.md section 2.8). A committed one the snapshot
+// sees; a rolled-back one has no changes left.
+func (s *Snapshot) Ended(xid uint64) bool {
+	x := XID(xid)
+	if x == 0 || x >= s.XMax {
+		return false
+	}
+	_, active := slices.BinarySearch(s.Active, x)
+	return !active
+}
+
 // LastWriter returns the most recent transaction that has started
 // writing, 0 if none since the engine opened (section 2.5).
 func (e *Engine) LastWriter() XID {
@@ -83,9 +96,10 @@ func (e *Engine) LiveSnapshots() int {
 }
 
 // releaseUndo releases the undo segments that no live snapshot needs:
-// every committed transaction's that each snapshot sees (section 2.6). The
-// caller holds the writer slot, or no transaction can be writing, so the
-// records it logs never fall inside another transaction's.
+// those of transactions that ended, committed or rolled back, before every
+// live snapshot was taken (section 2.6; docs/design/17-rollback.md section
+// 2.8). The caller holds the writer slot, or no transaction can be
+// writing, so the records it logs never fall inside another transaction's.
 func (e *Engine) releaseUndo(ctx context.Context) error {
 	if e.keepUndo {
 		return nil
@@ -108,7 +122,7 @@ func (e *Engine) undoReleasable(xid XID) bool {
 		return false
 	}
 	for s := range e.snaps {
-		if !s.Sees(uint64(xid)) {
+		if !s.Ended(uint64(xid)) {
 			return false
 		}
 	}

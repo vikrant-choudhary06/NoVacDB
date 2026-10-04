@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"errors"
 	"fmt"
 	"maps"
 	"math/rand/v2"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/sqlerr"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/types"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/vfs"
 )
 
 // Concurrent readers with one writer (docs/design/16-snapshots-
@@ -50,11 +50,6 @@ func resultRows(r *Result) string {
 		lines = append(lines, strings.Join(cells, "|"))
 	}
 	return strings.Join(lines, "\n")
-}
-
-func isSerializationFailure(err error) bool {
-	var se *sqlerr.Error
-	return errors.As(err, &se) && se.Code == sqlerr.SerializationFailure
 }
 
 // TestConcurrentModel runs one writer, which commits and rolls back random
@@ -147,7 +142,7 @@ func TestConcurrentModel(t *testing.T) {
 		}
 	}()
 
-	var checks, conflicts atomic.Int64
+	var checks atomic.Int64
 	for r := range 3 {
 		wg.Add(1)
 		go func() {
@@ -191,10 +186,9 @@ func TestConcurrentModel(t *testing.T) {
 					}
 					return tx.Commit(bg)
 				}()
-				switch {
-				case isSerializationFailure(err):
-					conflicts.Add(1) // the writer rolled back: the database reopened
-				case err != nil:
+				// Rollbacks use undo (docs/design/17-rollback.md): nothing
+				// reopens, so no snapshot is lost, and 40001 never comes.
+				if err != nil {
 					errc <- err
 					return
 				}
@@ -210,8 +204,11 @@ func TestConcurrentModel(t *testing.T) {
 		t.Fatalf("%d checks, %d commits, %d index scans", checks.Load(), commits.Load(), db.indexScans.Load())
 	}
 	checkConsistency(t, db)
-	t.Logf("%d checks, %d commits, %d rollbacks, %d conflicts, %d index scans, %d redone as table scans",
-		checks.Load(), commits.Load(), rollbacks.Load(), conflicts.Load(), db.indexScans.Load(), db.indexScanRetries.Load())
+	if db.discards.Load() != 0 || db.rollbacks.Load() != rollbacks.Load() {
+		t.Fatalf("%d rollbacks with undo, %d by reopening; the writer rolled back %d", db.rollbacks.Load(), db.discards.Load(), rollbacks.Load())
+	}
+	t.Logf("%d checks, %d commits, %d rollbacks, %d index scans, %d redone as table scans",
+		checks.Load(), commits.Load(), rollbacks.Load(), db.indexScans.Load(), db.indexScanRetries.Load())
 }
 
 // TestDDLWithConcurrentWriters runs DDL, multi-statement writing
@@ -297,9 +294,9 @@ func TestDDLWithConcurrentWriters(t *testing.T) {
 	checkConsistency(t, db)
 }
 
-// TestRollbackWhileReading rolls back writing transactions, which reopens
-// the database, while autocommit readers run: they wait for the reopen
-// and never fail, and never see the rolled-back rows.
+// TestRollbackWhileReading rolls back writing transactions with undo while
+// autocommit readers run: they never fail, and never see the rolled-back
+// rows, by heap or by index, during the rollbacks or after.
 func TestRollbackWhileReading(t *testing.T) {
 	db := newDB(t)
 	mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, v int); CREATE INDEX ON t (v)")
@@ -435,20 +432,16 @@ func TestIndexScanAfterWriterBegins(t *testing.T) {
 	}
 }
 
-// TestRestartWhileReading: a statement too large for the pool restarts
-// the database (reopening it) while autocommit readers run; they wait for
-// the reopen and never fail.
+// TestRestartWhileReading: a statement whose commit hits an I/O failure
+// restarts the database (reopening it) while autocommit readers run; they
+// wait for the reopen and never fail. (A statement too large for the pool
+// no longer restarts it: it is undone in place, docs/design/17-rollback.md
+// section 2.5.)
 func TestRestartWhileReading(t *testing.T) {
-	db := openDB(t, newFS(t), Options{Frames: 24})
+	m := newFS(t)
+	db := openDB(t, m, Options{})
 	t.Cleanup(func() { _ = db.Close(bg) })
 	mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, pad text); INSERT INTO t VALUES (1, 'one'), (2, 'two')")
-	big := "INSERT INTO t VALUES "
-	for i := 3; i < 3000; i++ {
-		if i > 3 {
-			big += ", "
-		}
-		big += fmt.Sprintf("(%d, '%0200d')", i, i)
-	}
 	var stop atomic.Bool
 	errc := make(chan error, 4)
 	var rg sync.WaitGroup
@@ -459,14 +452,12 @@ func TestRestartWhileReading(t *testing.T) {
 			defer rg.Done()
 			for !stop.Load() {
 				r, err := db.Exec(bg, q)
-				if sqlerr.Code(err) == sqlerr.ProgramLimitExceeded {
-					continue // the writer holds most of the pool
-				}
 				if err != nil {
 					errc <- fmt.Errorf("%s: %w", q, err)
 					return
 				}
-				if got := resultRows(r[0]); got != "1\n2" {
+				// A failed commit may or may not have happened.
+				if got := resultRows(r[0]); !strings.HasPrefix(got, "1\n2") {
 					errc <- fmt.Errorf("%s: %q", q, got)
 					return
 				}
@@ -475,8 +466,10 @@ func TestRestartWhileReading(t *testing.T) {
 		}()
 	}
 	restarts := db.restarts.Load()
-	for range 5 {
-		expectErr(t, db, big, sqlerr.ProgramLimitExceeded)
+	for i := range 5 {
+		m.InjectError(vfs.Fault{Op: vfs.OpSync})
+		expectErr(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, 'x')", 10+i), sqlerr.IOError)
+		m.ClearFaults()
 	}
 	stop.Store(true)
 	rg.Wait()

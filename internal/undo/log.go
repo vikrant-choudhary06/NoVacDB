@@ -273,6 +273,32 @@ func (l *Log) Last(xid uint64) Ptr {
 	return 0
 }
 
+// Rewind makes to, a record of xid or 0, the transaction's latest record
+// again, after a rollback reversed the records after it
+// (docs/design/17-rollback.md section 2.4): the next record appended
+// follows it. The records after it stay in the segment, unreachable, until
+// it is released. This is in memory only; recovery finds the last record
+// in the pages, but it discards a transaction that had not ended.
+func (l *Log) Rewind(ctx context.Context, xid uint64, to Ptr) error {
+	if to != 0 {
+		rec, err := l.Read(ctx, to)
+		if err != nil {
+			return fmt.Errorf("rewinding undo of transaction %d: %w", xid, err)
+		}
+		if rec.XID != xid {
+			return fmt.Errorf("rewinding undo of transaction %d to a record of %d: %w", xid, rec.XID, ErrCorrupt)
+		}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	seg := l.segs[xid]
+	if seg == nil {
+		return fmt.Errorf("rewinding undo of transaction %d: %w", xid, ErrNoSegment)
+	}
+	seg.last = to
+	return nil
+}
+
 // Segments returns the transactions that have an undo segment, in
 // increasing order.
 func (l *Log) Segments() []uint64 {

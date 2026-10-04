@@ -187,17 +187,28 @@ func TestRepeatableReadWriteConflict(t *testing.T) {
 	checkConsistency(t, db)
 }
 
-// A rollback reopens the database (until Step 6.5): a REPEATABLE READ
-// transaction that already has its snapshot cannot go on.
+// A rollback with undo leaves REPEATABLE READ snapshots alone
+// (docs/design/17-rollback.md section 2.5); a reopen (here, the rollback of
+// a transaction that changed the schema) ends them, with 40001.
 func TestRepeatableReadAcrossAReopen(t *testing.T) {
 	db := isoSetup(t)
 	tx := beginTx(t, db, RepeatableRead)
-	txRows(t, tx, "SELECT v FROM t")
+	before := txRows(t, tx, "SELECT id, v FROM t ORDER BY id")
 	w, err := db.Begin(bg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Exec(bg, "INSERT INTO t VALUES (9, 'z')"); err != nil {
+	if _, err := w.Exec(bg, "INSERT INTO t VALUES (9, 'z'); UPDATE t SET v = 'changed' WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Rollback(bg); err != nil {
+		t.Fatal(err)
+	}
+	if got := txRows(t, tx, "SELECT id, v FROM t ORDER BY id"); got != before {
+		t.Fatalf("after another session's rollback: %q, want %q", got, before)
+	}
+	w, _ = db.Begin(bg)
+	if _, err := w.Exec(bg, "CREATE TABLE gone (a int)"); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Rollback(bg); err != nil {
@@ -210,7 +221,7 @@ func TestRepeatableReadAcrossAReopen(t *testing.T) {
 	rc := beginTx(t, db, ReadCommitted)
 	txRows(t, rc, "SELECT v FROM t")
 	w, _ = db.Begin(bg)
-	if _, err := w.Exec(bg, "INSERT INTO t VALUES (9, 'z')"); err != nil {
+	if _, err := w.Exec(bg, "CREATE TABLE gone (a int)"); err != nil {
 		t.Fatal(err)
 	}
 	_ = w.Rollback(bg)

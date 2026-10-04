@@ -886,7 +886,7 @@ func runHeapModel(t *testing.T, seed uint64, steps int) (movedRows int) {
 			if v, err := h.Get(bg, rid); err != nil || v.XID != xid || v.Undo != xid*3 || !bytes.Equal(v.Data, d) {
 				t.Fatalf("%s: Get after update: %+v, %v", ctx, v.RowHeader, err)
 			}
-		case op < 80:
+		case op < 68:
 			rid, ok := pick()
 			if !ok {
 				continue
@@ -898,6 +898,47 @@ func runHeapModel(t *testing.T, seed uint64, steps int) (movedRows int) {
 			deleted[rid] = xid
 			if _, err := h.get(bg, rid); !errors.Is(err, ErrRowDeleted) {
 				t.Fatalf("%s: deleted row readable: %v", ctx, err)
+			}
+		case op < 75:
+			// Restore a version over a live row or a tombstone, as a
+			// rollback does.
+			rid, ok := pick()
+			if len(deleted) > 0 && (!ok || rng.IntN(2) == 0) {
+				tombs := make([]RID, 0, len(deleted))
+				for r := range deleted {
+					tombs = append(tombs, r)
+				}
+				slices.SortFunc(tombs, func(a, b RID) int {
+					if a.Page != b.Page {
+						return int(a.Page) - int(b.Page)
+					}
+					return int(a.Slot) - int(b.Slot)
+				})
+				rid, ok = tombs[rng.IntN(len(tombs))], true
+			}
+			if !ok {
+				continue
+			}
+			d := rowBytes(rng, heapRowSize(rng))
+			if err := h.Restore(bg, rid, Version{RowHeader: RowHeader{XID: xid, Undo: xid * 5}, Data: d}); err != nil {
+				t.Fatalf("%s: Restore(%s): %v", ctx, rid, err)
+			}
+			delete(deleted, rid)
+			model[rid] = modelRow{d, xid}
+			if v, err := h.Get(bg, rid); err != nil || v.XID != xid || v.Undo != xid*5 || !bytes.Equal(v.Data, d) {
+				t.Fatalf("%s: Get after Restore: %+v, %v", ctx, v.RowHeader, err)
+			}
+		case op < 80:
+			rid, ok := pick()
+			if !ok {
+				continue
+			}
+			if err := h.Remove(bg, rid); err != nil {
+				t.Fatalf("%s: Remove(%s): %v", ctx, rid, err)
+			}
+			delete(model, rid)
+			if _, err := h.GetVersion(bg, rid); !errors.Is(err, ErrSlotNotFound) {
+				t.Fatalf("%s: removed row still there: %v", ctx, err)
 			}
 		case op < 92:
 			if rid, ok := pick(); ok {
@@ -1515,5 +1556,76 @@ func TestTombstoneReads(t *testing.T) {
 	}
 	if _, ok := live[plain]; ok {
 		t.Fatal("Scan returned a tombstone")
+	}
+}
+
+// TestRestoreAndRemove: a rollback's heap operations on every kind of
+// tuple (docs/design/17-rollback.md section 2.3).
+func TestRestoreAndRemove(t *testing.T) {
+	_, h := newHeapEnv(t, 8)
+	plain, _ := h.put(bg, []byte("plain"))
+	moved, _ := h.put(bg, []byte("moved"))
+	tomb, _ := h.put(bg, []byte("tomb"))
+	tombMoved, _ := h.put(bg, []byte("tomb-moved"))
+	h.fillPage(t, 0, 9)
+	for _, rid := range []RID{moved, tombMoved} {
+		if err := h.set(bg, rid, bytes.Repeat([]byte{7}, 3000)); err != nil {
+			t.Fatal(err)
+		}
+		if stub, _ := h.readTuple(bg, rid); stub.kind != tupleStub {
+			t.Fatal("setup: row did not move")
+		}
+	}
+	for _, rid := range []RID{tomb, tombMoved} {
+		if err := h.del(bg, rid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Restoring: a plain row in place, a moved row home (the page is full,
+	// so it stays moved), and tombstones, with a version too big for the
+	// home page.
+	big := bytes.Repeat([]byte{3}, 2500)
+	for _, c := range []struct {
+		rid  RID
+		data []byte
+	}{{plain, []byte("plain-2")}, {moved, []byte("m")}, {tomb, big}, {tombMoved, []byte("t")}} {
+		v := Version{RowHeader: RowHeader{XID: 77, Undo: 1234}, Data: c.data}
+		if err := h.Restore(bg, c.rid, v); err != nil {
+			t.Fatalf("Restore(%s): %v", c.rid, err)
+		}
+		got, err := h.GetVersion(bg, c.rid)
+		if err != nil || got.Deleted || got.RowHeader != v.RowHeader || !bytes.Equal(got.Data, c.data) {
+			t.Fatalf("after Restore(%s): %+v, %v", c.rid, got.RowHeader, err)
+		}
+	}
+	if err := h.Restore(bg, plain, Version{RowHeader: RowHeader{XID: 1}, Deleted: true}); !errors.Is(err, ErrInvalidVersion) {
+		t.Fatalf("restoring a tombstone: %v", err)
+	}
+	if err := h.Restore(bg, plain, Version{RowHeader: RowHeader{XID: 0}, Data: []byte("x")}); !errors.Is(err, ErrInvalidVersion) {
+		t.Fatalf("restoring transaction 0: %v", err)
+	}
+	// Removing a plain row and a moved one frees their slots, and the
+	// moved-in tuple too.
+	if stub, _ := h.readTuple(bg, tomb); stub.kind != tupleStub {
+		t.Fatal("setup: the big restored row did not move")
+	}
+	before := scanAll(t, h)
+	for _, rid := range []RID{plain, tomb} {
+		if err := h.Remove(bg, rid); err != nil {
+			t.Fatalf("Remove(%s): %v", rid, err)
+		}
+		if _, err := h.GetVersion(bg, rid); !errors.Is(err, ErrSlotNotFound) {
+			t.Fatalf("removed %s: %v", rid, err)
+		}
+		delete(before, rid)
+	}
+	sameRows(t, scanAll(t, h), before, "after Remove")
+	h.checkTuples(t)
+	h.checkFSM(t)
+	if err := h.del(bg, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Remove(bg, moved); !errors.Is(err, ErrRowDeleted) {
+		t.Fatalf("removing a tombstone: %v", err)
 	}
 }

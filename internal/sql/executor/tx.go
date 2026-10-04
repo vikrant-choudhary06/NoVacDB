@@ -164,18 +164,25 @@ func (tx *Tx) Commit(ctx context.Context) error {
 	return nil
 }
 
-// Rollback ends the transaction without its changes. A transaction that
-// changed something is discarded the way Step 6.1 can: the database
-// reopens, and recovery leaves the transaction out (section 2.6).
+// Rollback ends the transaction without its changes, undoing them with
+// undo; a transaction that changed the schema is discarded by reopening the
+// database (docs/design/17-rollback.md section 2.7).
 func (tx *Tx) Rollback(ctx context.Context) error {
 	if tx.done {
 		return sqlerr.New(sqlerr.InvalidTransactionState, "the transaction has already ended")
 	}
-	defer tx.end()
 	if tx.wtx == nil || tx.discarded {
+		tx.end()
 		return nil
 	}
-	return tx.db.discard(context.WithoutCancel(ctx), tx.wtx, tx.held())
+	// The transaction's snapshot must not hold back the undo the rollback
+	// releases (section 2.8).
+	if tx.snap != nil {
+		tx.snap.Release()
+		tx.snap = nil
+	}
+	defer tx.end()
+	return tx.db.rollback(context.WithoutCancel(ctx), tx.wtx, tx.held(), tx.locked)
 }
 
 // held returns how the transaction holds db.mu between statements.

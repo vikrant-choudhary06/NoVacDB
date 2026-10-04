@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -132,29 +133,15 @@ func (st *stmt) checkUnique(tbl *catalog.Table, changes []change) error {
 	return nil
 }
 
-// applyChanges writes checked changes: first every old index entry goes,
-// then each row is written and its new entries added, so that rows may
-// swap unique keys within one statement.
-func applyChanges(ctx context.Context, w mvcc.Writer, tbl *catalog.Table, changes []change) error {
-	for _, c := range changes {
-		if c.old == nil {
-			continue
-		}
-		for _, ix := range tbl.Indexes {
-			key, err := ix.Key(c.old, c.rid)
-			if err != nil {
-				return err
-			}
-			found, err := ix.Tree.Delete(ctx, key)
-			if err != nil {
-				return err
-			}
-			if !found {
-				return fmt.Errorf("index %q has no entry for row %v: %w", ix.Name, c.rid, btree.ErrCorruptNode)
-			}
-		}
-	}
-	for _, c := range changes {
+// applyChanges writes checked changes, one row at a time: the row first
+// (its undo record before it), then its old index entries go and its new
+// ones are added. An index entry of a row is therefore never changed
+// before the row's undo record exists, which a rollback needs
+// (docs/design/17-rollback.md section 2.2). Every index key ends with the
+// row's RID, so rows may swap unique keys within one statement in any
+// order; uniqueness was checked before (checkUnique).
+func applyChanges(ctx context.Context, w mvcc.Writer, tbl *catalog.Table, changes []change, hook changeHook) error {
+	for i, c := range changes {
 		rid := c.rid
 		var err error
 		switch {
@@ -169,17 +156,85 @@ func applyChanges(ctx context.Context, w mvcc.Writer, tbl *catalog.Table, change
 		if err != nil {
 			return err
 		}
-		if c.new == nil {
-			continue
+		if err := hook.call(i, changeWritten); err != nil {
+			return err
 		}
-		for _, ix := range tbl.Indexes {
-			key, err := ix.Key(c.new, rid)
-			if err != nil {
+		if c.old != nil {
+			if err := deleteEntries(ctx, tbl, c.old, rid, false); err != nil {
 				return err
 			}
-			if err := ix.Tree.Insert(ctx, key, catalog.EncodeRID(rid)); err != nil {
-				return fmt.Errorf("index %q: %w", ix.Name, err)
+		}
+		if err := hook.call(i, changeOldEntries); err != nil {
+			return err
+		}
+		if c.new != nil {
+			if err := addEntries(ctx, tbl, c.new, rid, false); err != nil {
+				return err
 			}
+		}
+		if err := hook.call(i, changeNewEntries); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// changeHook lets tests fail a statement at any point of its changes: it
+// is called after change i's row is written, after its old index entries
+// are deleted, and after its new ones are added.
+type changeHook func(i int, stage changeStage) error
+
+type changeStage int
+
+const (
+	changeWritten changeStage = iota
+	changeOldEntries
+	changeNewEntries
+)
+
+func (h changeHook) call(i int, stage changeStage) error {
+	if h == nil {
+		return nil
+	}
+	return h(i, stage)
+}
+
+// deleteEntries deletes the index entries of row at rid. Each must exist,
+// unless missingOK (a rollback, whose statement may have failed before
+// adding them).
+func deleteEntries(ctx context.Context, tbl *catalog.Table, row []types.Value, rid storage.RID, missingOK bool) error {
+	for _, ix := range tbl.Indexes {
+		key, err := ix.Key(row, rid)
+		if err != nil {
+			return err
+		}
+		found, err := ix.Tree.Delete(ctx, key)
+		if err != nil {
+			return err
+		}
+		if !found && !missingOK {
+			return fmt.Errorf("index %q has no entry for row %v: %w", ix.Name, rid, btree.ErrCorruptNode)
+		}
+	}
+	return nil
+}
+
+// addEntries adds the index entries of row at rid. With presentOK (a
+// rollback, whose statement may have failed before deleting them), an
+// entry already there is left as it is.
+func addEntries(ctx context.Context, tbl *catalog.Table, row []types.Value, rid storage.RID, presentOK bool) error {
+	for _, ix := range tbl.Indexes {
+		key, err := ix.Key(row, rid)
+		if err != nil {
+			return err
+		}
+		err = ix.Tree.Insert(ctx, key, catalog.EncodeRID(rid))
+		if presentOK && errors.Is(err, btree.ErrKeyExists) {
+			// The key ends with the RID: the entry is this row's.
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("index %q: %w", ix.Name, err)
 		}
 	}
 	return nil
@@ -197,7 +252,7 @@ func (st *stmt) write(tbl *catalog.Table, changes []change) error {
 		return err
 	}
 	err := st.apply(false, func(ctx context.Context, xid wal.XID) error {
-		return applyChanges(ctx, st.writer(xid, uint64(tbl.ID)), tbl, changes)
+		return applyChanges(ctx, st.writer(xid, uint64(tbl.ID)), tbl, changes, st.db.changeHook)
 	})
 	return err
 }
