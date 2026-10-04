@@ -8,7 +8,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 
 ## Current step
 
-👉 **Step 6.3 — In-place updates with row versioning** (design doc `15-row-versioning.md` first)
+👉 **Step 6.3 — In-place updates with row versioning** (design doc `15-row-versioning.md` awaiting review)
 
 ---
 
