@@ -198,7 +198,7 @@ func (w *workload) rowSize() int {
 	case r < 98:
 		return tupleHeaderSize + w.rng.IntN(4000)
 	default:
-		return storage.MaxTupleSize - w.rng.IntN(30)
+		return storage.MaxRowData - w.rng.IntN(30)
 	}
 }
 
@@ -328,10 +328,11 @@ func (d *db) open(id ids) (c contents, err error) {
 		d.heaps[i], d.rids[i], rows[i] = h, map[uint64]storage.RID{}, map[uint64][]byte{}
 		s := h.Scan()
 		for {
-			rid, data, ok, err := s.Next(bg)
+			rid, v, ok, err := s.Next(bg)
 			if err != nil {
 				return c, fmt.Errorf("scanning heap %d: %w", i, err)
 			}
+			data := v.Data
 			if !ok {
 				break
 			}
@@ -348,23 +349,26 @@ func (d *db) open(id ids) (c contents, err error) {
 	return c, nil
 }
 
+// stamp gives every row the same header: this workload tests logging and
+// recovery of heap pages, not row versions (the SQL workload does those).
+func stamp(storage.RID, *storage.Version) (storage.RowHeader, error) {
+	return storage.RowHeader{XID: 1}, nil
+}
+
 // do performs one operation on the database.
 func (d *db) do(o op) error {
 	switch o.kind {
 	case opInsert:
-		rid, err := d.heaps[o.heap].Insert(bg, tupleFor(o.key, o.version, o.size))
+		rid, err := d.heaps[o.heap].Insert(bg, tupleFor(o.key, o.version, o.size), stamp)
 		if err == nil {
 			d.rids[o.heap][o.key] = rid
 		}
 		return err
 	case opUpdate:
-		rid, err := d.heaps[o.heap].Update(bg, d.rids[o.heap][o.key], tupleFor(o.key, o.version, o.size))
-		if err == nil {
-			d.rids[o.heap][o.key] = rid
-		}
-		return err
+		// The row keeps its RID, even when it moves.
+		return d.heaps[o.heap].Update(bg, d.rids[o.heap][o.key], tupleFor(o.key, o.version, o.size), stamp)
 	case opDelete:
-		err := d.heaps[o.heap].Delete(bg, d.rids[o.heap][o.key])
+		err := d.heaps[o.heap].Delete(bg, d.rids[o.heap][o.key], stamp)
 		if err == nil {
 			delete(d.rids[o.heap], o.key)
 		}

@@ -25,8 +25,9 @@ const (
 	// FormatVersion is the on-disk format version written by this code.
 	// Version 2 added a Flags byte to B+Tree leaf cells
 	// (docs/design/08-btree.md, revision 2); version 3 added undo pages
-	// (docs/design/14-undo-log.md). Other versions are refused.
-	FormatVersion = 3
+	// (docs/design/14-undo-log.md); version 4 a header on every heap row
+	// (docs/design/15-row-versioning.md). Other versions are refused.
+	FormatVersion = 4
 	// MaxPages is the largest page count for which every page offset fits
 	// in an int64.
 	MaxPages = uint64(math.MaxInt64 / PageSize)

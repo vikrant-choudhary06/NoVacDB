@@ -1,6 +1,6 @@
 # 15 — Row Versioning (`internal/storage`, `internal/mvcc`, `internal/sql/executor`, `internal/catalog`)
 
-Status: **Step 6.3 designed; awaiting review.**
+Status: **Step 6.3 (row versioning) designed, approved and implemented** (notes in section 2.7).
 
 ## 1. Problem
 
@@ -45,7 +45,7 @@ The three kinds of tuple that are not a plain row:
 | Kind | Flags | Content after the flags |
 |---|---|---|
 | **Tombstone**: a deleted row | Deleted | XID and Undo only (18 bytes); the row is in the undo log |
-| **Forward stub**: a row that moved | Forward | reserved, then u64 page and u16 slot of the moved tuple (12 bytes) |
+| **Forward stub**: a row that moved | Forward | reserved, then u64 page and u16 slot of the moved tuple, then 6 reserved bytes (18 bytes, section 2.7) |
 | **Moved-in tuple**: the moved row itself | MovedIn | XID, Undo, then u64 page and u16 slot of its home (the stub), then the row |
 
 Every other combination of flags is corrupt.
@@ -73,7 +73,7 @@ There is **at most one hop**. If a moved row moves again, the stub is pointed at
 | Undo records, locks (6.6) | Name one RID forever | Need the RID they had at the time, or an update of every reference |
 | Old index entries (6.7) | Keep pointing at the right row | Point at a slot that may hold another row |
 | Rollback (6.5) | Restores the row at its RID | Must move the row back and fix the indexes |
-| Cost | One more page read for a moved row; 12 bytes at home | None while reading |
+| Cost | One more page read for a moved row; 18 bytes at home | None while reading |
 
 The extra read is paid only by rows that grew past their page. With MVCC, a stable RID removes a whole class of bugs.
 
@@ -117,10 +117,38 @@ Nothing reads old versions until Step 6.4, and rollback still discards a transac
 
 The maximum encoded row drops from 8148 to **8000 bytes** (approved in Step 6.2). A plain tuple is then at most 8018 bytes and a moved-in tuple 8028, both within a heap page (8148), and every version image fits an undo record. Rows of 8001 bytes or more are refused with `54000` "row is too big", as they are now above 8148.
 
-## 3. Formats (approval needed)
+### 2.7 Implementation notes (Step 6.3)
+
+- **A forward stub is 18 bytes, not 12: as big as a tombstone.** Deleting a moved row turns its stub into a tombstone. With a 12-byte stub, those 6 more bytes did not always fit on a full home page, and the delete failed. The heap model test found it. The 6 extra bytes are reserved and must be zero.
+- **Headers are given by a `Stamper`, not passed in.** An insert's undo record names the row's RID, and the row's header names the undo record, so neither can be written first with all it needs. The heap therefore takes a `Stamper` callback.
+  - It is called once per write, with the pages latched and before anything changes, with the RID (the slot an insert will take is known first) and the version being replaced.
+  - `mvcc` appends the undo record inside it.
+  - A write that must latch more pages and try again (a move) reuses the header it got, after checking that the row has not changed.
+- **The release at commit is in `wal.Txn.Commit`, not `mvcc.BeforeCommit`.** That is the one place every commit path goes through: the executor's statements and transactions, and the catalog's bootstrap.
+  - The `wal` package's own tests of the undo log (Step 6.2) turn the release off through an unexported field.
+  - Step 6.4 replaces the rule.
+- **Pool sizes.** A row write pins up to three heap pages (a second move), and while it is stamped, up to two heap pages and two undo pages. The engine therefore needs at least four frames, and refuses fewer. A logged heap alone needs three.
+  - With fewer frames, everything but a move still works, and a move fails cleanly with `ErrNoFreeFrames`.
+  - "No steal" still bounds a transaction by the pool (13-transactions.md section 2.6).
+- **A delete is logged as an update** of the slot to the tombstone. A move is logged with operation blocks (insert, update, delete), or images after a redo point, as before.
+- **The catalog's DDL methods take the transaction's ID**, since they write system table rows through `mvcc`.
+- **A row may be empty.** The header gives every tuple at least 18 bytes, so `ErrEmptyTuple` no longer applies to heap rows.
+- **`PrevForRow` may name released undo.** A row last changed by a committed transaction keeps the undo pointer it had. With the interim release (section 2.5), that record is freed with its transaction's segment. Nothing follows such a pointer in Step 6.3. Step 6.4 must not follow one either: a reader only follows the chain while versions are too new for its snapshot, and the released undo of a committed transaction is older than every snapshot.
+- **A slower test, made fast again.** `TestSelfRestartAfterIOFailure` replays its setup data for every write and sync it fails. Every insert now also writes and releases undo, and the race-detector run passed Go's 10-minute limit. The setup now inserts 40 rows per statement instead of one. The statements under test go through the same failure points as before (the counts differ by a few), and the test runs in 3 seconds instead of 55.
+- **Deliberate bugs:** 30, four at a time on copies of the code, each against its packages' tests with a 60-second limit; about 1.5 minutes in all.
+  - **Caught: 27.**
+  - **After new tests (4):** a forward stub leading to a moved-in tuple of another row; a move's choice of page never being one of the row's own pages; executor undo records carrying the table ID.
+  - **Hang fix:** one of those tests could hang when it failed, and was fixed first.
+  - **Not caught (3), all defensive checks a single writer cannot reach:**
+    - an insert landing in the slot `insertSlot` predicted;
+    - pages restored when an operation fails after its first change, which no reachable failure does;
+    - a row unchanged between its stamp and a move that latches more pages.
+  - They stay as safety nets for Step 6.6, when writers run concurrently.
+
+## 3. Formats (approved)
 
 - **Data file format version 4:** every heap tuple has the row header. Version-3 files are refused with the existing "unsupported format version" error. The phase rules approve this change for Step 6.3.
-- **WAL format version 4 (needs approval):** a heap record may hold **three** blocks instead of two. Moving a moved row again (2.2) changes three pages at once: the stub, the old moved-in tuple and the new one. One record keeps the three changes atomic in the log, as the two-page moves are today.
+- **WAL format version 4 (approved):** a heap record may hold **three** blocks instead of two. Moving a moved row again (2.2) changes three pages at once: the stub, the old moved-in tuple and the new one. One record keeps the three changes atomic in the log, as the two-page moves are today.
   - The alternative is two records that rely on the transaction for atomicity. It needs no format change, but a heap operation would then be atomic only inside a transaction, which the heap does not otherwise assume.
 - Undo records are unchanged; their image is the version image of 2.3.
 
@@ -165,4 +193,5 @@ The maximum encoded row drops from 8148 to **8000 bytes** (approved in Step 6.2)
 - Undo is released at commit (2.5), so there is no history across transactions until 6.4.
 - Tombstones stay until purge (6.8): 22 bytes per deleted row.
 - Index entries are still removed and added at once by the writer (6.7 changes this).
+- Dropping a table leaves tombstones in the system tables until purge (6.8).
 - A moved row costs one extra page read.

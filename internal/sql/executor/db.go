@@ -304,7 +304,7 @@ func (db *DB) tooMuch(err error, inTx bool) *sqlerr.Error {
 //
 // Cancellation is not honoured from here on: a statement that has begun
 // changing data runs to its end.
-func (st *stmt) apply(ddl bool, fn func(ctx context.Context) error) error {
+func (st *stmt) apply(ddl bool, fn func(ctx context.Context, xid wal.XID) error) error {
 	db := st.db
 	ctx := context.WithoutCancel(st.ctx)
 	var wtx *wal.Txn
@@ -318,7 +318,7 @@ func (st *stmt) apply(ddl bool, fn func(ctx context.Context) error) error {
 	}
 	var se *sqlerr.Error
 	err := wtx.Write(ctx, func(ctx context.Context) error {
-		ferr := fn(ctx)
+		ferr := fn(ctx, wtx.XID())
 		if ddl && errors.As(ferr, &se) {
 			return wal.Unchanged(ferr)
 		}

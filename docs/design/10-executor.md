@@ -70,7 +70,7 @@ A row is a heap tuple:
 
 Column encodings, little-endian: `integer` 4 bytes, `bigint` 8, `double precision` 8 (IEEE 754 bits), `boolean` 1 (`0` or `1`), `timestamptz` 8, `text` a u32 byte length then the bytes.
 
-Decoding needs the table's column types. It checks every length and value, so a damaged tuple is an error, never a panic. The stored column count allows `ALTER TABLE ADD COLUMN` later (Phase 10): a tuple with fewer columns than the table reads the missing ones as NULL. A row longer than a heap tuple can be (8148 bytes) is rejected with `54000` "row is too big"; there is no out-of-line storage for large values yet.
+Decoding needs the table's column types. It checks every length and value, so a damaged tuple is an error, never a panic. The stored column count allows `ALTER TABLE ADD COLUMN` later (Phase 10): a tuple with fewer columns than the table reads the missing ones as NULL. A row longer than 8000 bytes (since Step 6.3, so that every version fits an undo record; 15-row-versioning.md section 2.6) is rejected with `54000` "row is too big"; there is no out-of-line storage for large values yet.
 
 ### 2.3 Index keys (Step 4.3)
 
@@ -243,5 +243,5 @@ The database lock (2.6) serialises writers and excludes readers during writes. U
 - A statement can change at most the buffer pool's size in pages (2.4).
 - No joins, aggregates, subqueries or `GROUP BY` (Phase 7); `ORDER BY` sorts in memory, and results are fully built before they are returned.
 - One collation (bytes); the session time zone is always UTC.
-- No out-of-line storage: a row must fit in one page (8148 bytes).
+- No out-of-line storage: a row must fit in one page (at most 8000 bytes since Step 6.3).
 - Index scans use only simple `column op constant` terms.

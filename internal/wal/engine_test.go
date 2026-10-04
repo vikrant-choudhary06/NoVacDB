@@ -34,7 +34,7 @@ func TestEngineCreateReopenClose(t *testing.T) {
 	want := map[storage.RID][]byte{}
 	for range 300 {
 		d := payload(rng, 1+rng.IntN(3000))
-		rid, err := h.Insert(bg, d)
+		rid, err := heapInsert(h, d)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -66,7 +66,7 @@ func TestEngineCreateReopenClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	for rid, d := range want {
-		got, err := h2.Get(bg, rid)
+		got, err := heapGet(h2, rid)
 		if err != nil || !bytes.Equal(got, d) {
 			t.Fatalf("row %s after reopen: %v", rid, err)
 		}
@@ -92,7 +92,7 @@ func TestEngineRecoversAfterCrashAndReportsIt(t *testing.T) {
 	heapWork(t, h, rng, &rids, 100)
 	rows := map[storage.RID][]byte{}
 	for _, rid := range rids {
-		d, err := h.Get(bg, rid)
+		d, err := heapGet(h, rid)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -133,7 +133,7 @@ func scanEngineHeap(t testing.TB, h *storage.Heap) map[storage.RID][]byte {
 	out := map[storage.RID][]byte{}
 	s := h.Scan()
 	for {
-		rid, d, ok, err := s.Next(bg)
+		rid, d, ok, err := heapNext(s)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,7 +145,7 @@ func scanEngineHeap(t testing.TB, h *storage.Heap) map[storage.RID][]byte {
 }
 
 func TestEngineRejectsBadState(t *testing.T) {
-	if _, err := OpenEngine(bg, newFS(t), dbDir, EngineOptions{Frames: 1}); !errors.Is(err, ErrInvalidOptions) {
+	if _, err := OpenEngine(bg, newFS(t), dbDir, EngineOptions{Frames: 3}); !errors.Is(err, ErrInvalidOptions) {
 		t.Fatalf("one frame: %v", err)
 	}
 	t.Run("data file lost", func(t *testing.T) {
@@ -204,7 +204,7 @@ func TestEngineOpenFailsCleanlyOnIOErrors(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := h.Insert(bg, []byte("acknowledged")); err != nil {
+			if _, err := heapInsert(h, []byte("acknowledged")); err != nil {
 				t.Fatal(err)
 			}
 			if err := e.Flush(bg); err != nil {

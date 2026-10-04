@@ -9,11 +9,13 @@ import (
 	"strings"
 
 	"github.com/vikrant-choudhary06/NoVacDB/internal/btree"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/mvcc"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/ast"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/parser"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/sqlerr"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/types"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/storage"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/wal"
 )
 
 // maxNameLen is PostgreSQL's NAMEDATALEN-1, as the lexer enforces.
@@ -69,9 +71,9 @@ func resolve(t *Table, names []string) ([]int, error) {
 }
 
 // CreateTable creates a table and the indexes for its primary key and
-// unique constraints. The caller holds a statement group; if this fails
-// after changing anything, the caller must abandon the statement.
-func (c *Catalog) CreateTable(ctx context.Context, def TableDef) (*Table, error) {
+// unique constraints, in transaction xid. If this fails after changing
+// anything, the caller must abandon the transaction.
+func (c *Catalog) CreateTable(ctx context.Context, xid wal.XID, def TableDef) (*Table, error) {
 	if err := c.checkNewName(def.Name); err != nil {
 		return nil, err
 	}
@@ -119,19 +121,20 @@ func (c *Catalog) CreateTable(ctx context.Context, def TableDef) (*Table, error)
 		return nil, err
 	}
 	t.ID = c.newID()
-	if t.rid, err = c.insertSys(ctx, sysTables, []types.Value{
+	w := c.writer(xid)
+	if t.rid, err = c.insertSys(ctx, w, sysTables, []types.Value{
 		types.NewInt8(t.ID), types.NewText(t.Name), types.NewInt8(int64(t.Heap.FirstPage())),
 	}); err != nil {
 		return nil, err
 	}
 	for i, col := range t.Columns {
-		if col.rid, err = c.insertSys(ctx, sysColumns, columnRow(t.ID, i, col)); err != nil {
+		if col.rid, err = c.insertSys(ctx, w, sysColumns, columnRow(t.ID, i, col)); err != nil {
 			return nil, err
 		}
 	}
 	c.tables[t.Name] = t
 	if pk != nil {
-		if _, err := c.createIndex(ctx, t, c.chooseName(t.Name, nil, "pkey"), pk, true, true); err != nil {
+		if _, err := c.createIndex(ctx, w, t, c.chooseName(t.Name, nil, "pkey"), pk, true, true); err != nil {
 			return nil, err
 		}
 	}
@@ -140,7 +143,7 @@ func (c *Catalog) CreateTable(ctx context.Context, def TableDef) (*Table, error)
 		for i, p := range u {
 			names[i] = t.Columns[p].Name
 		}
-		if _, err := c.createIndex(ctx, t, c.chooseName(t.Name, names, "key"), u, true, false); err != nil {
+		if _, err := c.createIndex(ctx, w, t, c.chooseName(t.Name, names, "key"), u, true, false); err != nil {
 			return nil, err
 		}
 	}
@@ -161,13 +164,19 @@ func columnRow(tableID int64, pos int, col *Column) []types.Value {
 
 // insertSys adds a row to a system table. It runs after changes have been
 // made, so its errors are never *sqlerr.Error (see the rule above).
-func (c *Catalog) insertSys(ctx context.Context, which int, row []types.Value) (storage.RID, error) {
+func (c *Catalog) insertSys(ctx context.Context, w mvcc.Writer, which int, row []types.Value) (storage.RID, error) {
 	data, err := types.EncodeRow(row, sysTypes[which])
 	if err != nil {
 		// The callers check the rows' sizes first; this is a bug.
 		return storage.RID{}, fmt.Errorf("catalog: encoding a %s row: %s", sysNames[which], err.Error())
 	}
-	return c.sys[which].Insert(ctx, data)
+	return w.Insert(ctx, c.sys[which], data)
+}
+
+// writer writes system table rows in transaction xid. System tables have
+// no catalog ID; their undo records carry table 0.
+func (c *Catalog) writer(xid wal.XID) mvcc.Writer {
+	return mvcc.Writer{Undo: c.e.Undo(), XID: uint64(xid)}
 }
 
 // chooseName picks a name for an index as PostgreSQL does: table, columns
@@ -201,7 +210,8 @@ func truncateUTF8(s string, n int) string {
 // CreateIndex creates an index on table columns. An empty name gets one
 // chosen as PostgreSQL does. The table is read first, so a unique index
 // over duplicate values or an oversized key fails before anything changes.
-func (c *Catalog) CreateIndex(ctx context.Context, t *Table, name string, cols []string, unique bool) (*Index, error) {
+// It runs in transaction xid.
+func (c *Catalog) CreateIndex(ctx context.Context, xid wal.XID, t *Table, name string, cols []string, unique bool) (*Index, error) {
 	pos, err := resolve(t, cols)
 	if err != nil {
 		return nil, err
@@ -211,7 +221,7 @@ func (c *Catalog) CreateIndex(ctx context.Context, t *Table, name string, cols [
 	} else if err := c.checkNewName(name); err != nil {
 		return nil, err
 	}
-	return c.createIndex(ctx, t, name, pos, unique, false)
+	return c.createIndex(ctx, c.writer(xid), t, name, pos, unique, false)
 }
 
 // indexEntry is a row's entry for an index, and for a unique index the
@@ -226,14 +236,14 @@ func (c *Catalog) rowEntries(ctx context.Context, ix *Index) ([]indexEntry, erro
 	s := ix.Table.Heap.Scan()
 	colTypes := ix.Table.Types()
 	for {
-		rid, data, ok, err := s.Next(ctx)
+		rid, v, ok, err := s.Next(ctx)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
 			return out, nil
 		}
-		row, err := types.DecodeRow(data, colTypes)
+		row, err := types.DecodeRow(v.Data, colTypes)
 		if err != nil {
 			return nil, err
 		}
@@ -249,7 +259,7 @@ func (c *Catalog) rowEntries(ctx context.Context, ix *Index) ([]indexEntry, erro
 	}
 }
 
-func (c *Catalog) createIndex(ctx context.Context, t *Table, name string, cols []int, unique, primary bool) (*Index, error) {
+func (c *Catalog) createIndex(ctx context.Context, w mvcc.Writer, t *Table, name string, cols []int, unique, primary bool) (*Index, error) {
 	ix := &Index{Name: name, Table: t, Columns: cols, Unique: unique, Primary: primary}
 	entries, err := c.rowEntries(ctx, ix)
 	if err != nil {
@@ -281,7 +291,7 @@ func (c *Catalog) createIndex(ctx context.Context, t *Table, name string, cols [
 	for i, p := range cols {
 		colList[i] = strconv.Itoa(p)
 	}
-	if ix.rid, err = c.insertSys(ctx, sysIndexes, []types.Value{
+	if ix.rid, err = c.insertSys(ctx, w, sysIndexes, []types.Value{
 		types.NewInt8(ix.ID), types.NewText(name), types.NewInt8(t.ID), types.NewInt8(int64(ix.Tree.Root())),
 		types.NewBool(unique), types.NewBool(primary), types.NewText(strings.Join(colList, ",")),
 	}); err != nil {
@@ -293,8 +303,9 @@ func (c *Catalog) createIndex(ctx context.Context, t *Table, name string, cols [
 }
 
 // DropTable removes a table and its indexes from the catalog and returns
-// their pages, which the caller frees once the statement has committed.
-func (c *Catalog) DropTable(ctx context.Context, t *Table) ([]uint64, error) {
+// their pages, which the caller frees once the statement has committed. It
+// runs in transaction xid.
+func (c *Catalog) DropTable(ctx context.Context, xid wal.XID, t *Table) ([]uint64, error) {
 	// Everything that can fail on a sound database happens before the
 	// first change.
 	pages := t.Heap.Pages()
@@ -305,17 +316,18 @@ func (c *Catalog) DropTable(ctx context.Context, t *Table) ([]uint64, error) {
 		}
 		pages = append(pages, ps...)
 	}
+	w := c.writer(xid)
 	for _, ix := range t.Indexes {
-		if err := c.sys[sysIndexes].Delete(ctx, ix.rid); err != nil {
+		if err := w.Delete(ctx, c.sys[sysIndexes], ix.rid); err != nil {
 			return nil, err
 		}
 	}
 	for _, col := range t.Columns {
-		if err := c.sys[sysColumns].Delete(ctx, col.rid); err != nil {
+		if err := w.Delete(ctx, c.sys[sysColumns], col.rid); err != nil {
 			return nil, err
 		}
 	}
-	if err := c.sys[sysTables].Delete(ctx, t.rid); err != nil {
+	if err := w.Delete(ctx, c.sys[sysTables], t.rid); err != nil {
 		return nil, err
 	}
 	for _, ix := range t.Indexes {
@@ -327,8 +339,8 @@ func (c *Catalog) DropTable(ctx context.Context, t *Table) ([]uint64, error) {
 
 // DropIndex removes an index and returns its pages, which the caller frees
 // once the statement has committed. A primary key's index cannot be dropped
-// alone.
-func (c *Catalog) DropIndex(ctx context.Context, ix *Index) ([]uint64, error) {
+// alone. It runs in transaction xid.
+func (c *Catalog) DropIndex(ctx context.Context, xid wal.XID, ix *Index) ([]uint64, error) {
 	if ix.Primary {
 		return nil, sqlerr.New(sqlerr.DependentObjectsStillExist, "cannot drop index %q because it is the primary key of table %q", ix.Name, ix.Table.Name).
 			WithHint("Drop the table instead; dropping a primary key alone is not supported yet.")
@@ -337,7 +349,7 @@ func (c *Catalog) DropIndex(ctx context.Context, ix *Index) ([]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := c.sys[sysIndexes].Delete(ctx, ix.rid); err != nil {
+	if err := c.writer(xid).Delete(ctx, c.sys[sysIndexes], ix.rid); err != nil {
 		return nil, err
 	}
 	delete(c.indexes, ix.Name)

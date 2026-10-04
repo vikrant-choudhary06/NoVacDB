@@ -8,10 +8,12 @@ import (
 
 	"github.com/vikrant-choudhary06/NoVacDB/internal/btree"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/catalog"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/mvcc"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/ast"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/sqlerr"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/types"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/storage"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/wal"
 )
 
 // change is one row write, computed and checked before anything changes.
@@ -133,7 +135,7 @@ func (st *stmt) checkUnique(tbl *catalog.Table, changes []change) error {
 // applyChanges writes checked changes: first every old index entry goes,
 // then each row is written and its new entries added, so that rows may
 // swap unique keys within one statement.
-func applyChanges(ctx context.Context, tbl *catalog.Table, changes []change) error {
+func applyChanges(ctx context.Context, w mvcc.Writer, tbl *catalog.Table, changes []change) error {
 	for _, c := range changes {
 		if c.old == nil {
 			continue
@@ -157,11 +159,12 @@ func applyChanges(ctx context.Context, tbl *catalog.Table, changes []change) err
 		var err error
 		switch {
 		case c.new == nil:
-			err = tbl.Heap.Delete(ctx, rid)
+			err = w.Delete(ctx, tbl.Heap, rid)
 		case c.old == nil:
-			rid, err = tbl.Heap.Insert(ctx, c.data)
+			rid, err = w.Insert(ctx, tbl.Heap, c.data)
 		default:
-			rid, err = tbl.Heap.Update(ctx, rid, c.data)
+			// The row keeps its RID, even if it moves (section 2.2).
+			err = w.Update(ctx, tbl.Heap, rid, c.data)
 		}
 		if err != nil {
 			return err
@@ -193,7 +196,10 @@ func (st *stmt) write(tbl *catalog.Table, changes []change) error {
 	if err := st.ctx.Err(); err != nil {
 		return err
 	}
-	err := st.apply(false, func(ctx context.Context) error { return applyChanges(ctx, tbl, changes) })
+	err := st.apply(false, func(ctx context.Context, xid wal.XID) error {
+		w := mvcc.Writer{Undo: st.db.e.Undo(), XID: uint64(xid), Table: uint64(tbl.ID)}
+		return applyChanges(ctx, w, tbl, changes)
+	})
 	return err
 }
 

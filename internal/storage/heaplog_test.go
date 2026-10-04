@@ -329,27 +329,32 @@ func TestLoggedHeapImageRule(t *testing.T) {
 	if b := lastBlocks(); len(b) != 1 || b[0].Kind != BlockImage || b[0].Page != h.FirstPage() {
 		t.Fatalf("create logged %+v", b)
 	}
-	rid, err := h.Insert(bg, []byte("first"))
+	rid, err := h.put(bg, []byte("first"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The page's LSN (from creation) is not below the redo point: an operation.
-	if b := lastBlocks(); b[0].Kind != BlockInsert || b[0].Slot != rid.Slot || string(b[0].Data) != "first" {
+	if b := lastBlocks(); b[0].Kind != BlockInsert || b[0].Slot != rid.Slot {
 		t.Fatalf("insert logged %+v", b[0])
+	} else if tu, err := decodeTuple(b[0].Data); err != nil || string(tu.data) != "first" || tu.hdr.XID != 1 {
+		t.Fatalf("insert logged tuple %+v, %v", tu, err)
 	}
 	e.lg.beginCheckpoint()
-	if _, err := h.Insert(bg, []byte("after checkpoint")); err != nil {
+	if _, err := h.put(bg, []byte("after checkpoint")); err != nil {
 		t.Fatal(err)
 	}
 	// First change after the redo point moved: a full image.
 	if b := lastBlocks(); b[0].Kind != BlockImage {
 		t.Fatalf("first change after checkpoint logged %v, want image", b[0].Kind)
 	}
-	if err := h.Delete(bg, rid); err != nil {
+	if err := h.del(bg, rid); err != nil {
 		t.Fatal(err)
 	}
-	if b := lastBlocks(); b[0].Kind != BlockDelete {
-		t.Fatalf("second change after checkpoint logged %v, want delete", b[0].Kind)
+	// A delete leaves a tombstone: an update of the slot.
+	if b := lastBlocks(); b[0].Kind != BlockUpdate {
+		t.Fatalf("second change after checkpoint logged %v, want update", b[0].Kind)
+	} else if tu, err := decodeTuple(b[0].Data); err != nil || tu.kind != tupleTombstone {
+		t.Fatalf("delete logged tuple %+v, %v", tu, err)
 	}
 	// Every page carries the LSN of the last record that changed it.
 	recs := e.lg.records()
@@ -369,60 +374,97 @@ func TestLoggedHeapGrowAndMoveAreSingleRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	small, err := h.Insert(bg, []byte("small"))
+	small, err := h.put(bg, []byte("small"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.Insert(bg, bytes.Repeat([]byte{1}, h.pages[0].free)); err != nil { // fill page 1
-		t.Fatal(err)
+	h.fillPage(t, 0, 1)
+	blocksOf := func(r fakeRec) map[uint64]BlockKind {
+		t.Helper()
+		blocks, err := DecodeHeapRecord(r.payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[uint64]BlockKind{}
+		for _, b := range blocks {
+			out[b.Page] = b.Kind
+		}
+		return out
 	}
 	before := len(e.lg.records())
-	moved, err := h.Update(bg, small, bytes.Repeat([]byte{2}, 3000)) // must grow, then move
-	if err != nil {
+	if err := h.set(bg, small, bytes.Repeat([]byte{2}, 3000)); err != nil { // must grow, then move
 		t.Fatal(err)
 	}
-	if moved.Page == small.Page {
-		t.Fatal("row did not move")
+	stub, err := h.readTuple(bg, small)
+	if err != nil || stub.kind != tupleStub {
+		t.Fatalf("row did not move: %+v %v", stub, err)
 	}
 	recs := e.lg.records()[before:]
 	if len(recs) != 2 {
 		t.Fatalf("grow+move wrote %d records, want 2 (one each)", len(recs))
 	}
-	grow, _ := DecodeHeapRecord(recs[0].payload)
-	move, _ := DecodeHeapRecord(recs[1].payload)
-	if len(grow) != 2 || len(move) != 2 {
-		t.Fatalf("grow has %d blocks, move has %d; want 2 and 2", len(grow), len(move))
-	}
-	pages := map[uint64]BlockKind{}
-	for _, b := range move {
-		pages[b.Page] = b.Kind
+	if grow := blocksOf(recs[0]); len(grow) != 2 {
+		t.Fatalf("grow has %d blocks, want 2", len(grow))
 	}
 	// Both pages were last changed after the redo point (no checkpoint has
 	// run), so both are logged as operations, not images.
-	if pages[small.Page] != BlockDelete || pages[moved.Page] != BlockInsert {
-		t.Fatalf("move blocks %v", pages)
+	if move := blocksOf(recs[1]); len(move) != 2 || move[small.Page] != BlockUpdate || move[stub.link.Page] != BlockInsert {
+		t.Fatalf("move blocks %v", move)
+	}
+
+	// Moving a moved row again changes three pages in one record: the stub,
+	// the old moved-in tuple and the new one.
+	h.fillPage(t, 1, 3)
+	before = len(e.lg.records())
+	if err := h.set(bg, small, bytes.Repeat([]byte{4}, 4000)); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := h.readTuple(bg, small)
+	recs = e.lg.records()[before:]
+	move := blocksOf(recs[len(recs)-1])
+	if len(move) != 3 || move[small.Page] != BlockUpdate || move[stub.link.Page] != BlockDelete || move[again.link.Page] != BlockInsert {
+		t.Fatalf("second move blocks %v (%d records)", move, len(recs))
+	}
+	// Moving back home: the home slot and the old moved-in tuple, one record.
+	before = len(e.lg.records())
+	if err := h.set(bg, small, []byte("s")); err != nil {
+		t.Fatal(err)
+	}
+	recs = e.lg.records()[before:]
+	if len(recs) != 1 {
+		t.Fatalf("moving home wrote %d records", len(recs))
+	}
+	if home := blocksOf(recs[0]); len(home) != 2 || home[small.Page] != BlockUpdate || home[again.link.Page] != BlockDelete {
+		t.Fatalf("moving home blocks %v", home)
 	}
 	e.checkRule(t)
 }
 
-func TestLoggedHeapNeedsTwoFramesForTwoPageWork(t *testing.T) {
-	e := newLoggedEnv(t, 2)
+// A logged heap's three-page moves work with only three frames, whatever
+// else the pool holds.
+func TestLoggedHeapWorksWithThreeFrames(t *testing.T) {
+	e := newLoggedEnv(t, 3)
 	h, err := CreateHeap(bg, e.bp, WithLogger(e.lg))
 	if err != nil {
 		t.Fatal(err)
 	}
+	rng := rand.New(rand.NewPCG(7, 7))
 	var rids []RID
-	for range 20 { // many pages: constant eviction, grows and moves with only two frames
-		rid, err := h.Insert(bg, bytes.Repeat([]byte{3}, 2000))
+	for range 20 { // many pages: constant eviction, grows and moves
+		rid, err := h.put(bg, bytes.Repeat([]byte{3}, 2000))
 		if err != nil {
 			t.Fatal(err)
 		}
 		rids = append(rids, rid)
 	}
-	for _, rid := range rids[:5] {
-		if _, err := h.Update(bg, rid, bytes.Repeat([]byte{4}, 5000)); err != nil {
+	for range 60 {
+		rid := rids[rng.IntN(len(rids))]
+		if err := h.set(bg, rid, bytes.Repeat([]byte{4}, 1+rng.IntN(7000))); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if h.checkTuples(t) == 0 {
+		t.Fatal("no row moved")
 	}
 	h.checkFSM(t)
 	e.checkRule(t)
@@ -471,7 +513,7 @@ func runLoggedWorkload(t *testing.T, e *loggedEnv, rng *rand.Rand, steps int, he
 		case op < 40:
 			h := hs[rng.IntN(len(hs))]
 			d := rowBytes(rng, heapRowSize(rng))
-			rid, err := h.Insert(bg, d)
+			rid, err := h.put(bg, d)
 			if err != nil {
 				t.Fatalf("step %d insert: %v", step, err)
 			}
@@ -479,18 +521,14 @@ func runLoggedWorkload(t *testing.T, e *loggedEnv, rng *rand.Rand, steps int, he
 		case op < 65:
 			if rid, ok := pick(); ok {
 				d := rowBytes(rng, heapRowSize(rng))
-				nr, err := owner[rid].Update(bg, rid, d)
-				if err != nil {
+				if err := owner[rid].set(bg, rid, d); err != nil {
 					t.Fatalf("step %d update: %v", step, err)
 				}
-				h := owner[rid]
-				delete(model, rid)
-				delete(owner, rid)
-				model[nr], owner[nr] = d, h
+				model[rid] = d
 			}
 		case op < 85:
 			if rid, ok := pick(); ok {
-				if err := owner[rid].Delete(bg, rid); err != nil {
+				if err := owner[rid].del(bg, rid); err != nil {
 					t.Fatalf("step %d delete: %v", step, err)
 				}
 				delete(model, rid)
@@ -498,7 +536,7 @@ func runLoggedWorkload(t *testing.T, e *loggedEnv, rng *rand.Rand, steps int, he
 			}
 		case op < 95:
 			if rid, ok := pick(); ok {
-				got, err := owner[rid].Get(bg, rid)
+				got, err := owner[rid].get(bg, rid)
 				if err != nil || !bytes.Equal(got, model[rid]) {
 					t.Fatalf("step %d get: %v", step, err)
 				}
@@ -526,7 +564,7 @@ func TestReplayReproducesPagesExactly(t *testing.T) {
 		seed := base + uint64(i)
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			rng := rand.New(rand.NewPCG(seed, 77))
-			e := newLoggedEnv(t, 2+rng.IntN(6))
+			e := newLoggedEnv(t, 3+rng.IntN(6))
 			model, _, hs := runLoggedWorkload(t, e, rng, 600, 1+rng.IntN(3))
 			e.checkRule(t)
 			if e.lg.imageCnt == 0 || e.lg.opCnt == 0 || e.store.writes.Load() == 0 {
@@ -585,12 +623,12 @@ func TestReplayFromRedoPointRepairsTornPages(t *testing.T) {
 		seed := base + 1000 + uint64(i)
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			rng := rand.New(rand.NewPCG(seed, 78))
-			e := newLoggedEnv(t, 2+rng.IntN(6))
+			e := newLoggedEnv(t, 3+rng.IntN(6))
 			_, redo, hs := runLoggedWorkload(t, e, rng, 500, 1+rng.IntN(2))
 			// Make sure some pages changed after the last checkpoint, so
 			// there is something for a crash to tear.
 			for range 20 {
-				if _, err := hs[0].Insert(bg, rowBytes(rng, heapRowSize(rng))); err != nil {
+				if _, err := hs[0].put(bg, rowBytes(rng, heapRowSize(rng))); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -656,7 +694,7 @@ func TestLoggedHeapConcurrentReplay(t *testing.T) {
 			for i := range 150 {
 				switch {
 				case len(mine) == 0 || rng.IntN(3) == 0:
-					rid, err := retryBusy(func() (RID, error) { return h.Insert(bg, concRow(byte(w), uint64(i), 9+rng.IntN(2500))) })
+					rid, err := retryBusy(func() (RID, error) { return h.put(bg, concRow(byte(w), uint64(i), 9+rng.IntN(2500))) })
 					if err != nil {
 						t.Errorf("insert: %v", err)
 						return
@@ -664,15 +702,15 @@ func TestLoggedHeapConcurrentReplay(t *testing.T) {
 					mine = append(mine, rid)
 				case rng.IntN(2) == 0:
 					j := rng.IntN(len(mine))
-					nr, err := retryBusy(func() (RID, error) { return h.Update(bg, mine[j], concRow(byte(w), uint64(i), 9+rng.IntN(4000))) })
-					if err != nil {
+					if _, err := retryBusy(func() (struct{}, error) {
+						return struct{}{}, h.set(bg, mine[j], concRow(byte(w), uint64(i), 9+rng.IntN(4000)))
+					}); err != nil {
 						t.Errorf("update: %v", err)
 						return
 					}
-					mine[j] = nr
 				default:
 					j := rng.IntN(len(mine))
-					if _, err := retryBusy(func() (struct{}, error) { return struct{}{}, h.Delete(bg, mine[j]) }); err != nil {
+					if _, err := retryBusy(func() (struct{}, error) { return struct{}{}, h.del(bg, mine[j]) }); err != nil {
 						t.Errorf("delete: %v", err)
 						return
 					}
@@ -705,21 +743,18 @@ func TestLoggedHeapConcurrentReplay(t *testing.T) {
 // --- failure atomicity -------------------------------------------------------
 
 func TestFailedLogLeavesPagesUntouched(t *testing.T) {
-	setup := func(t *testing.T) (*loggedEnv, *Heap, RID, RID) {
+	setup := func(t *testing.T) (*loggedEnv, *Heap, RID) {
 		e := newLoggedEnv(t, 8)
 		h, err := CreateHeap(bg, e.bp, WithLogger(e.lg))
 		if err != nil {
 			t.Fatal(err)
 		}
-		a, err := h.Insert(bg, []byte("aaaa"))
+		a, err := h.put(bg, []byte("aaaa"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		b, err := h.Insert(bg, bytes.Repeat([]byte{9}, h.pages[0].free)) // page full
-		if err != nil {
-			t.Fatal(err)
-		}
-		return e, h, a, b
+		h.fillPage(t, 0, 9) // page full
+		return e, h, a
 	}
 	snapshot := func(e *loggedEnv) map[uint64][]byte {
 		out := map[uint64][]byte{}
@@ -730,34 +765,48 @@ func TestFailedLogLeavesPagesUntouched(t *testing.T) {
 		}
 		return out
 	}
-	ops := map[string]func(h *Heap, a, b RID) error{
-		"insert":            func(h *Heap, a, b RID) error { _, err := h.Insert(bg, []byte("x")); return err },
-		"insert that grows": func(h *Heap, a, b RID) error { _, err := h.Insert(bg, bytes.Repeat([]byte{1}, 6000)); return err },
-		"update in place":   func(h *Heap, a, b RID) error { _, err := h.Update(bg, a, []byte("bb")); return err },
-		"update that moves": func(h *Heap, a, b RID) error {
-			_, err := h.Update(bg, a, bytes.Repeat([]byte{2}, 4000))
-			return err
+	ops := map[string]func(h *Heap, a RID) error{
+		"insert":            func(h *Heap, a RID) error { _, err := h.put(bg, []byte("x")); return err },
+		"insert that grows": func(h *Heap, a RID) error { _, err := h.put(bg, bytes.Repeat([]byte{1}, 6000)); return err },
+		"update in place":   func(h *Heap, a RID) error { return h.set(bg, a, []byte("bb")) },
+		"update that moves": func(h *Heap, a RID) error { return h.set(bg, a, bytes.Repeat([]byte{2}, 4000)) },
+		"update that moves again": func(h *Heap, a RID) error {
+			return h.set(bg, a, bytes.Repeat([]byte{2}, 7000))
 		},
-		"delete": func(h *Heap, a, b RID) error { return h.Delete(bg, a) },
-		"create heap": func(h *Heap, a, b RID) error {
+		"update that moves home": func(h *Heap, a RID) error { return h.set(bg, a, []byte("c")) },
+		"delete":                 func(h *Heap, a RID) error { return h.del(bg, a) },
+		"delete of a moved row":  func(h *Heap, a RID) error { return h.del(bg, a) },
+		"create heap": func(h *Heap, a RID) error {
 			_, err := CreateHeap(bg, h.bp, WithLogger(h.lg))
 			return err
 		},
 	}
 	for name, op := range ops {
 		t.Run(name, func(t *testing.T) {
-			e, h, a, b := setup(t)
-			if name == "update that moves" {
+			e, h, a := setup(t)
+			switch name {
+			case "update that moves":
 				// Make sure a second page exists so the move itself (not a
 				// grow) is the logged step that fails.
-				if _, err := h.Insert(bg, bytes.Repeat([]byte{3}, 100)); err != nil {
+				if _, err := h.put(bg, bytes.Repeat([]byte{3}, 100)); err != nil {
 					t.Fatal(err)
+				}
+			case "update that moves again", "update that moves home", "delete of a moved row":
+				// a has moved to a second page; a third has room for it.
+				if err := h.set(bg, a, bytes.Repeat([]byte{2}, 4000)); err != nil {
+					t.Fatal(err)
+				}
+				if err := h.growLogged(bg); err != nil {
+					t.Fatal(err)
+				}
+				if stub, err := h.readTuple(bg, a); err != nil || stub.kind != tupleStub {
+					t.Fatalf("setup: row did not move: %v", err)
 				}
 			}
 			before := snapshot(e)
 			beforeRows := scanAll(t, h)
 			e.lg.setFail(errBoom)
-			if err := op(h, a, b); !errors.Is(err, errBoom) {
+			if err := op(h, a); !errors.Is(err, errBoom) {
 				t.Fatalf("err = %v, want the logger's error", err)
 			}
 			e.lg.setFail(nil)
@@ -771,7 +820,7 @@ func TestFailedLogLeavesPagesUntouched(t *testing.T) {
 			h.checkFSM(t)
 			sameRows(t, scanAll(t, h), beforeRows, "rows after the failed operation")
 			// The heap keeps working once the log does.
-			if _, err := h.Insert(bg, []byte("later")); err != nil {
+			if _, err := h.put(bg, []byte("later")); err != nil {
 				t.Fatalf("heap unusable after a failed log append: %v", err)
 			}
 		})
@@ -831,7 +880,7 @@ func TestFlushWhilePageChangesDuringLogForce(t *testing.T) {
 			}
 			if !changed { // someone changes the page right after the log was forced
 				changed = true
-				if _, err := h.Insert(ctx, []byte("sneaked in")); err != nil {
+				if _, err := h.put(ctx, []byte("sneaked in")); err != nil {
 					return err
 				}
 			}
@@ -845,7 +894,7 @@ func TestFlushWhilePageChangesDuringLogForce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.Insert(bg, []byte("first")); err != nil {
+	if _, err := h.put(bg, []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 	if err := bp.FlushPage(bg, h.FirstPage()); err != nil {
@@ -943,9 +992,9 @@ func TestTwoPageLatchesNeverDeadlock(t *testing.T) {
 				x, y = b, a
 			}
 			for range 2000 {
-				err := withTwoPages(bg, e.bp, x, y, func(_, _ *SlottedPage) (bool, error) {
+				err := h.withPages(bg, []uint64{x, y}, func(*edit) error {
 					runtime.Gosched() // hold both latches while others queue
-					return false, nil
+					return nil
 				})
 				if err != nil {
 					t.Error(err)
@@ -984,14 +1033,16 @@ func TestPagesAreDirtyBeforeTheirRecordIsAppended(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rid, err := h.Insert(bg, []byte("row"))
+	rid, err := h.put(bg, []byte("row"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	filler, err := h.Insert(bg, bytes.Repeat([]byte{1}, h.pages[0].free-slotSize-10))
+	// A filler leaving the page almost full, so the row's growth moves it.
+	filler, err := h.put(bg, bytes.Repeat([]byte{1}, min(h.pages[0].free-RowHeaderSize-slotSize-10, MaxRowData)))
 	if err != nil {
 		t.Fatal(err)
 	}
+	h.fillPage(t, 0, 2)
 	checks := 0
 	lg.after = func() {
 		recs := e.lg.records()
@@ -1006,10 +1057,12 @@ func TestPagesAreDirtyBeforeTheirRecordIsAppended(t *testing.T) {
 		checks++
 	}
 	ops := []func() error{
-		func() error { _, err := h.Insert(bg, []byte("x")); return err },
-		func() error { _, err := h.Update(bg, rid, []byte("same size!")); return err },
-		func() error { _, err := h.Update(bg, rid, bytes.Repeat([]byte{2}, 3000)); return err }, // moves (grows first)
-		func() error { return h.Delete(bg, filler) },
+		func() error { _, err := h.put(bg, []byte("x")); return err },
+		func() error { return h.set(bg, rid, []byte("same size!")) },
+		func() error { return h.set(bg, rid, bytes.Repeat([]byte{2}, 3000)) }, // moves (grows first)
+		func() error { return h.set(bg, rid, bytes.Repeat([]byte{2}, 7000)) }, // moves again
+		func() error { return h.set(bg, rid, []byte("home")) },                // moves home
+		func() error { return h.del(bg, filler) },
 		func() error { _, err := CreateHeap(bg, e.bp, WithLogger(lg)); return err },
 	}
 	for i, op := range ops {

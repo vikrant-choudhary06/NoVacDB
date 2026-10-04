@@ -54,7 +54,7 @@ func scanAll(t testing.TB, h *Heap) map[RID][]byte {
 	got := map[RID][]byte{}
 	s := h.Scan()
 	for {
-		rid, data, ok, err := s.Next(bg)
+		rid, data, ok, err := s.nextData(bg)
 		if err != nil {
 			t.Fatalf("Scan: %v", err)
 		}
@@ -135,23 +135,23 @@ func TestHeapInsertGet(t *testing.T) {
 	want := map[RID][]byte{}
 	for i := range 50 {
 		d := rowBytes(rng, 1+i*7)
-		rid, err := h.Insert(bg, d)
+		rid, err := h.put(bg, d)
 		if err != nil {
 			t.Fatal(err)
 		}
 		want[rid] = d
 	}
 	for rid, d := range want {
-		got, err := h.Get(bg, rid)
+		got, err := h.get(bg, rid)
 		if err != nil || !bytes.Equal(got, d) {
 			t.Fatalf("Get(%s): %v", rid, err)
 		}
 	}
 	// Get returns a copy: changing it must not change the heap.
 	for rid, d := range want {
-		got, _ := h.Get(bg, rid)
+		got, _ := h.get(bg, rid)
 		got[0] ^= 0xFF
-		again, _ := h.Get(bg, rid)
+		again, _ := h.get(bg, rid)
 		if !bytes.Equal(again, d) {
 			t.Fatal("Get result aliases heap storage")
 		}
@@ -170,7 +170,7 @@ func TestHeapEmpty(t *testing.T) {
 	if h.NumPages() != 1 {
 		t.Fatalf("NumPages = %d", h.NumPages())
 	}
-	if _, err := h.Get(bg, RID{Page: h.FirstPage(), Slot: 0}); !errors.Is(err, ErrSlotNotFound) {
+	if _, err := h.get(bg, RID{Page: h.FirstPage(), Slot: 0}); !errors.Is(err, ErrSlotNotFound) {
 		t.Fatalf("Get on empty heap err = %v", err)
 	}
 	e.bp.checkInvariants(t, 0)
@@ -178,45 +178,68 @@ func TestHeapEmpty(t *testing.T) {
 
 func TestHeapRejectsBadTuplesAndRIDs(t *testing.T) {
 	e, h := newHeapEnv(t, 4)
-	rid, err := h.Insert(bg, []byte("row"))
+	rid, err := h.put(bg, []byte("row"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.Insert(bg, nil); !errors.Is(err, ErrEmptyTuple) {
-		t.Errorf("Insert(nil) err = %v", err)
-	}
-	if _, err := h.Insert(bg, make([]byte, MaxTupleSize+1)); !errors.Is(err, ErrTupleTooLarge) {
+	if _, err := h.put(bg, make([]byte, MaxRowData+1)); !errors.Is(err, ErrTupleTooLarge) {
 		t.Errorf("oversize err = %v", err)
 	}
-	if _, err := h.Update(bg, rid, nil); !errors.Is(err, ErrEmptyTuple) {
-		t.Errorf("Update(nil) err = %v", err)
-	}
-	if _, err := h.Update(bg, rid, make([]byte, MaxTupleSize+1)); !errors.Is(err, ErrTupleTooLarge) {
+	if err := h.set(bg, rid, make([]byte, MaxRowData+1)); !errors.Is(err, ErrTupleTooLarge) {
 		t.Errorf("Update oversize err = %v", err)
+	}
+	// A row may be empty: the header gives the tuple its bytes.
+	empty, err := h.put(bg, nil)
+	if err != nil {
+		t.Fatalf("empty row: %v", err)
+	}
+	if got, err := h.get(bg, empty); err != nil || len(got) != 0 {
+		t.Fatalf("empty row read back: %q, %v", got, err)
 	}
 	other := e.newStamped(t, 1) // a heap-type page that is not part of this heap
 	for _, bad := range []RID{{Page: 0}, {Page: 1}, {Page: other}, {Page: 1 << 40}} {
-		if _, err := h.Get(bg, bad); !errors.Is(err, ErrInvalidRID) {
+		if _, err := h.get(bg, bad); !errors.Is(err, ErrInvalidRID) {
 			t.Errorf("Get(%s) err = %v", bad, err)
 		}
-		if err := h.Delete(bg, bad); !errors.Is(err, ErrInvalidRID) {
+		if err := h.del(bg, bad); !errors.Is(err, ErrInvalidRID) {
 			t.Errorf("Delete(%s) err = %v", bad, err)
 		}
-		if _, err := h.Update(bg, bad, []byte{1}); !errors.Is(err, ErrInvalidRID) {
+		if err := h.set(bg, bad, []byte{1}); !errors.Is(err, ErrInvalidRID) {
 			t.Errorf("Update(%s) err = %v", bad, err)
 		}
 	}
-	for _, bad := range []RID{{Page: rid.Page, Slot: rid.Slot + 1}, {Page: rid.Page, Slot: 65535}} {
-		if _, err := h.Get(bg, bad); !errors.Is(err, ErrSlotNotFound) {
+	for _, bad := range []RID{{Page: rid.Page, Slot: empty.Slot + 1}, {Page: rid.Page, Slot: 65535}} {
+		if _, err := h.get(bg, bad); !errors.Is(err, ErrSlotNotFound) {
 			t.Errorf("Get(%s) err = %v", bad, err)
 		}
-		if err := h.Delete(bg, bad); !errors.Is(err, ErrSlotNotFound) {
+		if err := h.del(bg, bad); !errors.Is(err, ErrSlotNotFound) {
 			t.Errorf("Delete(%s) err = %v", bad, err)
 		}
-		if _, err := h.Update(bg, bad, []byte{1}); !errors.Is(err, ErrSlotNotFound) {
+		if err := h.set(bg, bad, []byte{1}); !errors.Is(err, ErrSlotNotFound) {
 			t.Errorf("Update(%s) err = %v", bad, err)
 		}
 	}
+	// A Stamper's error, or a header with transaction 0, changes nothing.
+	boom := errors.New("boom")
+	failing := func(RID, *Version) (RowHeader, error) { return RowHeader{}, boom }
+	before := scanAll(t, h)
+	if _, err := h.Insert(bg, []byte("x"), failing); !errors.Is(err, boom) {
+		t.Errorf("Insert with a failing stamp: %v", err)
+	}
+	if err := h.Update(bg, rid, []byte("x"), failing); !errors.Is(err, boom) {
+		t.Errorf("Update with a failing stamp: %v", err)
+	}
+	if err := h.Delete(bg, rid, failing); !errors.Is(err, boom) {
+		t.Errorf("Delete with a failing stamp: %v", err)
+	}
+	if _, err := h.Insert(bg, []byte("x"), stampXID(0)); !errors.Is(err, ErrInvalidVersion) {
+		t.Errorf("Insert with transaction 0: %v", err)
+	}
+	if err := h.Update(bg, rid, []byte("x"), stampXID(0)); !errors.Is(err, ErrInvalidVersion) {
+		t.Errorf("Update with transaction 0: %v", err)
+	}
+	sameRows(t, scanAll(t, h), before, "after refused writes")
+	h.checkFSM(t)
 	e.bp.checkInvariants(t, 0)
 }
 
@@ -226,13 +249,13 @@ func TestHeapGrowsAcrossPages(t *testing.T) {
 	want := map[RID][]byte{}
 	for i := range rows {
 		d := bytes.Repeat([]byte{byte(i)}, rowSize)
-		rid, err := h.Insert(bg, d)
+		rid, err := h.put(bg, d)
 		if err != nil {
 			t.Fatal(err)
 		}
 		want[rid] = d
 	}
-	perPage := slotAreaSize / (rowSize + slotSize)
+	perPage := slotAreaSize / (RowHeaderSize + rowSize + slotSize)
 	if wantPages := (rows + perPage - 1) / perPage; h.NumPages() != wantPages {
 		t.Fatalf("NumPages = %d, want %d (%d rows per page)", h.NumPages(), wantPages, perPage)
 	}
@@ -245,8 +268,8 @@ func TestHeapMaxSizeRowsOnePerPage(t *testing.T) {
 	_, h := newHeapEnv(t, 4)
 	want := map[RID][]byte{}
 	for i := range 6 {
-		d := bytes.Repeat([]byte{byte(i + 1)}, MaxTupleSize)
-		rid, err := h.Insert(bg, d)
+		d := bytes.Repeat([]byte{byte(i + 1)}, MaxRowData)
+		rid, err := h.put(bg, d)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -259,84 +282,154 @@ func TestHeapMaxSizeRowsOnePerPage(t *testing.T) {
 	h.checkFSM(t)
 }
 
-func TestHeapDeleteReusesSpaceAndSlots(t *testing.T) {
+// A deleted row leaves a tombstone of RowHeaderSize bytes: its space is
+// mostly given back at once, and its slot is kept until purge.
+func TestHeapDeleteLeavesTombstones(t *testing.T) {
 	_, h := newHeapEnv(t, 4)
 	var rids []RID
 	for range 30 {
-		rid, err := h.Insert(bg, bytes.Repeat([]byte{1}, 2000))
+		rid, err := h.put(bg, bytes.Repeat([]byte{1}, 2000))
 		if err != nil {
 			t.Fatal(err)
 		}
 		rids = append(rids, rid)
 	}
 	pages := h.NumPages()
-	for _, rid := range rids[:10] {
-		if err := h.Delete(bg, rid); err != nil {
+	for i, rid := range rids[:10] {
+		if err := h.Delete(bg, rid, stampXID(uint64(100+i))); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := h.Get(bg, rid); !errors.Is(err, ErrSlotNotFound) {
+		if _, err := h.get(bg, rid); !errors.Is(err, ErrRowDeleted) {
 			t.Fatalf("deleted row still readable: %v", err)
 		}
-		if err := h.Delete(bg, rid); !errors.Is(err, ErrSlotNotFound) {
+		if err := h.del(bg, rid); !errors.Is(err, ErrRowDeleted) {
 			t.Fatalf("double delete err = %v", err)
 		}
+		if err := h.set(bg, rid, []byte("x")); !errors.Is(err, ErrRowDeleted) {
+			t.Fatalf("update of a deleted row err = %v", err)
+		}
+		// The tombstone carries the deleter's header.
+		tomb, err := h.readTuple(bg, rid)
+		if err != nil || tomb.kind != tupleTombstone || tomb.hdr.XID != uint64(100+i) || len(tomb.data) != 0 {
+			t.Fatalf("tombstone %+v, %v", tomb, err)
+		}
 	}
+	// The freed space takes new rows; the slots are not reused.
 	for range 10 {
-		if _, err := h.Insert(bg, bytes.Repeat([]byte{2}, 2000)); err != nil {
+		rid, err := h.put(bg, bytes.Repeat([]byte{2}, 1900))
+		if err != nil {
 			t.Fatal(err)
+		}
+		if slices.Contains(rids[:10], rid) {
+			t.Fatalf("new row reused the deleted row's slot %s", rid)
 		}
 	}
 	if h.NumPages() != pages {
 		t.Fatalf("heap grew from %d to %d pages although 10 rows were freed", pages, h.NumPages())
 	}
+	if n := len(scanAll(t, h)); n != 30 {
+		t.Fatalf("scan saw %d rows, want 30", n)
+	}
 	h.checkFSM(t)
 }
 
-func TestHeapUpdate(t *testing.T) {
+func TestHeapUpdateKeepsTheRID(t *testing.T) {
 	_, h := newHeapEnv(t, 6)
-	small, err := h.Insert(bg, []byte("small"))
+	small, err := h.put(bg, []byte("small"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Fill the rest of the page with a neighbour so growth cannot fit there.
-	neighbour, err := h.Insert(bg, bytes.Repeat([]byte{9}, h.pages[0].free-slotSize))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if neighbour.Page != small.Page {
-		t.Fatal("setup: neighbour on another page")
-	}
-
-	// Smaller or equal: always in place, same RID.
-	for _, d := range [][]byte{[]byte("tiny"), []byte("fivee"), []byte("x")} {
-		got, err := h.Update(bg, small, d)
-		if err != nil || got != small {
-			t.Fatalf("shrinking update: %s, %v", got, err)
+	// Fill the rest of the page with neighbours so growth cannot fit there.
+	rows := 1 + h.fillPage(t, 0, 9)
+	check := func(want []byte, wantKind tupleKind) {
+		t.Helper()
+		got, err := h.get(bg, small)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("row %s: %q, %v", small, got, err)
 		}
+		home, err := h.readTuple(bg, small)
+		if err != nil || home.kind != wantKind {
+			t.Fatalf("home slot holds kind %d, want %d (%v)", home.kind, wantKind, err)
+		}
+		all := scanAll(t, h)
+		if len(all) != rows || !bytes.Equal(all[small], want) {
+			t.Fatalf("scan: %d rows, row %q", len(all), all[small])
+		}
+		h.checkFSM(t)
 	}
-	// Grows beyond the page: moves, returns a new RID, old RID is gone.
+	// Smaller or equal: in place.
+	for _, d := range [][]byte{[]byte("tiny"), []byte("fivee"), []byte("x")} {
+		if err := h.set(bg, small, d); err != nil {
+			t.Fatal(err)
+		}
+		check(d, tuplePlain)
+	}
+	// Grows beyond the page: moves, the home slot forwards, the RID stays.
 	big := bytes.Repeat([]byte{7}, 500)
-	moved, err := h.Update(bg, small, big)
-	if err != nil {
+	if err := h.set(bg, small, big); err != nil {
 		t.Fatal(err)
 	}
-	if moved == small || moved.Page == small.Page {
-		t.Fatalf("row did not move: %s -> %s", small, moved)
+	check(big, tupleStub)
+	stub, _ := h.readTuple(bg, small)
+	first := stub.link
+	if first.Page == small.Page {
+		t.Fatalf("moved to its own page: %s", first)
 	}
-	if _, err := h.Get(bg, small); !errors.Is(err, ErrSlotNotFound) {
-		t.Fatalf("old RID still readable: %v", err)
+	// Grows again but fits where it moved: in place there.
+	bigger := bytes.Repeat([]byte{8}, 600)
+	if err := h.set(bg, small, bigger); err != nil {
+		t.Fatal(err)
 	}
-	if got, err := h.Get(bg, moved); err != nil || !bytes.Equal(got, big) {
-		t.Fatalf("moved row: %v", err)
+	check(bigger, tupleStub)
+	if again, _ := h.readTuple(bg, small); again.link != first {
+		t.Fatalf("moved again although it fit: %s -> %s", first, again.link)
 	}
-	// The neighbour is untouched, and the scan sees each row exactly once.
-	rows := scanAll(t, h)
-	if len(rows) != 2 || !bytes.Equal(rows[moved], big) {
-		t.Fatalf("scan after move: %d rows", len(rows))
+	// Too big for the page it moved to: moves again, still one hop.
+	rows += h.fillPage(t, 1, 3)
+	huge := bytes.Repeat([]byte{6}, 3000)
+	if err := h.set(bg, small, huge); err != nil {
+		t.Fatal(err)
 	}
-	// Update of a dead RID.
-	if _, err := h.Update(bg, small, []byte("z")); !errors.Is(err, ErrSlotNotFound) {
-		t.Fatalf("update dead row err = %v", err)
+	second, _ := h.readTuple(bg, small)
+	if second.kind != tupleStub || second.link.Page == first.Page || second.link.Page == small.Page {
+		t.Fatalf("second move: %+v", second)
+	}
+	if _, err := h.readTuple(bg, first); !errors.Is(err, ErrSlotNotFound) {
+		t.Fatalf("old moved-in tuple left behind: %v", err)
+	}
+	if got, err := h.get(bg, small); err != nil || !bytes.Equal(got, huge) {
+		t.Fatalf("after the second move: %v", err)
+	}
+	// Small again: back home, and the moved-in tuple is gone.
+	if err := h.set(bg, small, []byte("home")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.readTuple(bg, second.link); !errors.Is(err, ErrSlotNotFound) {
+		t.Fatalf("moved-in tuple left behind after moving home: %v", err)
+	}
+	if got, err := h.get(bg, small); err != nil || string(got) != "home" {
+		t.Fatalf("back home: %q, %v", got, err)
+	}
+	if n := len(scanAll(t, h)); n != rows {
+		t.Fatalf("scan saw %d rows, want %d", n, rows)
+	}
+	// A moved-in tuple is not a row ID.
+	if err := h.set(bg, small, huge); err != nil {
+		t.Fatal(err)
+	}
+	away, _ := h.readTuple(bg, small)
+	if _, err := h.get(bg, away.link); !errors.Is(err, ErrSlotNotFound) {
+		t.Fatalf("Get of a moved-in tuple: %v", err)
+	}
+	// Deleting a moved row removes both tuples.
+	if err := h.del(bg, small); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.readTuple(bg, away.link); !errors.Is(err, ErrSlotNotFound) {
+		t.Fatalf("moved-in tuple left after delete: %v", err)
+	}
+	if _, err := h.get(bg, small); !errors.Is(err, ErrRowDeleted) {
+		t.Fatalf("deleted moved row: %v", err)
 	}
 	h.checkFSM(t)
 }
@@ -344,7 +437,7 @@ func TestHeapUpdate(t *testing.T) {
 func TestHeapScanOrderAndConcurrentAppend(t *testing.T) {
 	_, h := newHeapEnv(t, 4)
 	for i := range 40 {
-		if _, err := h.Insert(bg, bytes.Repeat([]byte{byte(i)}, 700)); err != nil {
+		if _, err := h.put(bg, bytes.Repeat([]byte{byte(i)}, 700)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -353,7 +446,7 @@ func TestHeapScanOrderAndConcurrentAppend(t *testing.T) {
 	s := h.Scan()
 	seen := map[RID]bool{}
 	for i := 0; ; i++ {
-		rid, _, ok, err := s.Next(bg)
+		rid, _, ok, err := s.nextData(bg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -366,7 +459,7 @@ func TestHeapScanOrderAndConcurrentAppend(t *testing.T) {
 		seen[rid] = true
 		if i == 5 {
 			for range 10 {
-				if _, err := h.Insert(bg, bytes.Repeat([]byte{0xEE}, 3000)); err != nil {
+				if _, err := h.put(bg, bytes.Repeat([]byte{0xEE}, 3000)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -376,7 +469,7 @@ func TestHeapScanOrderAndConcurrentAppend(t *testing.T) {
 		t.Fatalf("scan saw only %d rows", len(seen))
 	}
 	// A finished scanner stays finished.
-	if _, _, ok, err := s.Next(bg); ok || err != nil {
+	if _, _, ok, err := s.nextData(bg); ok || err != nil {
 		t.Fatalf("Next after end: ok=%v err=%v", ok, err)
 	}
 }
@@ -388,7 +481,7 @@ func TestOpenHeapAfterReopen(t *testing.T) {
 	want := map[RID][]byte{}
 	for range 300 {
 		d := rowBytes(rng, 1+rng.IntN(1500))
-		rid, err := h.Insert(bg, d)
+		rid, err := h.put(bg, d)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -402,7 +495,7 @@ func TestOpenHeapAfterReopen(t *testing.T) {
 	sameRows(t, scanAll(t, h), want, "after reopen")
 	h.checkFSM(t)
 	// The reopened heap keeps working: insert, then reopen once more.
-	rid, err := h.Insert(bg, []byte("after reopen"))
+	rid, err := h.put(bg, []byte("after reopen"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +508,7 @@ func TestOpenHeapRejectsDamage(t *testing.T) {
 	build := func(t *testing.T) (*env, *Heap) {
 		e, h := newHeapEnv(t, 8)
 		for range 12 {
-			if _, err := h.Insert(bg, bytes.Repeat([]byte{5}, 3000)); err != nil {
+			if _, err := h.put(bg, bytes.Repeat([]byte{5}, 3000)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -539,7 +632,7 @@ func TestOpenHeapRejectsDamage(t *testing.T) {
 
 func TestHeapFaultsLeaveNoPins(t *testing.T) {
 	e, h := newHeapEnv(t, 3)
-	rid, err := h.Insert(bg, []byte("row"))
+	rid, err := h.put(bg, []byte("row"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,16 +643,16 @@ func TestHeapFaultsLeaveNoPins(t *testing.T) {
 		e.newStamped(t, 0)
 	}
 	e.spy.set(&e.spy.failRead, errBoom)
-	if _, err := h.Get(bg, rid); !errors.Is(err, errBoom) {
+	if _, err := h.get(bg, rid); !errors.Is(err, errBoom) {
 		t.Fatalf("Get err = %v", err)
 	}
-	if _, err := h.Insert(bg, []byte("x")); !errors.Is(err, errBoom) {
+	if _, err := h.put(bg, []byte("x")); !errors.Is(err, errBoom) {
 		t.Fatalf("Insert err = %v", err)
 	}
-	if err := h.Delete(bg, rid); !errors.Is(err, errBoom) {
+	if err := h.del(bg, rid); !errors.Is(err, errBoom) {
 		t.Fatalf("Delete err = %v", err)
 	}
-	if _, err := h.Update(bg, rid, []byte("y")); !errors.Is(err, errBoom) {
+	if err := h.set(bg, rid, []byte("y")); !errors.Is(err, errBoom) {
 		t.Fatalf("Update err = %v", err)
 	}
 	if _, _, _, err := h.Scan().Next(bg); !errors.Is(err, errBoom) {
@@ -570,21 +663,21 @@ func TestHeapFaultsLeaveNoPins(t *testing.T) {
 	}
 	e.bp.checkInvariants(t, 0)
 	e.spy.set(&e.spy.failRead, nil)
-	if got, err := h.Get(bg, rid); err != nil || string(got) != "row" {
+	if got, err := h.get(bg, rid); err != nil || string(got) != "row" {
 		t.Fatalf("heap unusable after faults: %v", err)
 	}
 }
 
 func TestHeapGrowFailures(t *testing.T) {
 	e, h := newHeapEnv(t, 3)
-	fill := bytes.Repeat([]byte{1}, MaxTupleSize)
-	if _, err := h.Insert(bg, fill); err != nil { // first page full
+	fill := bytes.Repeat([]byte{1}, MaxRowData)
+	if _, err := h.put(bg, fill); err != nil { // first page full
 		t.Fatal(err)
 	}
 	pages := h.NumPages()
 
 	e.spy.set(&e.spy.failAlloc, errBoom)
-	if _, err := h.Insert(bg, fill); !errors.Is(err, errBoom) {
+	if _, err := h.put(bg, fill); !errors.Is(err, errBoom) {
 		t.Fatalf("allocation failure err = %v", err)
 	}
 	e.spy.set(&e.spy.failAlloc, nil)
@@ -598,7 +691,7 @@ func TestHeapGrowFailures(t *testing.T) {
 	e.newStamped(t, 2)
 	e.newStamped(t, 3) // the tail is evicted from the pool
 	e.spy.set(&e.spy.failRead, errBoom)
-	if _, err := h.Insert(bg, fill); !errors.Is(err, errBoom) {
+	if _, err := h.put(bg, fill); !errors.Is(err, errBoom) {
 		t.Fatalf("link failure err = %v", err)
 	}
 	e.spy.set(&e.spy.failRead, nil)
@@ -606,7 +699,7 @@ func TestHeapGrowFailures(t *testing.T) {
 		t.Fatalf("failed grow changed page count: %d -> %d", pages, h.NumPages())
 	}
 	e.bp.checkInvariants(t, 0)
-	if _, err := h.Insert(bg, fill); err != nil {
+	if _, err := h.put(bg, fill); err != nil {
 		t.Fatalf("heap unusable after failed grow: %v", err)
 	}
 	h.checkFSM(t)
@@ -614,16 +707,16 @@ func TestHeapGrowFailures(t *testing.T) {
 
 func TestHeapCancelledContext(t *testing.T) {
 	_, h := newHeapEnv(t, 4)
-	rid, _ := h.Insert(bg, []byte("a"))
+	rid, _ := h.put(bg, []byte("a"))
 	ctx, cancel := context.WithCancel(bg)
 	cancel()
-	if _, err := h.Insert(ctx, []byte("b")); !errors.Is(err, context.Canceled) {
+	if _, err := h.put(ctx, []byte("b")); !errors.Is(err, context.Canceled) {
 		t.Errorf("Insert err = %v", err)
 	}
-	if _, err := h.Get(ctx, rid); !errors.Is(err, context.Canceled) {
+	if _, err := h.get(ctx, rid); !errors.Is(err, context.Canceled) {
 		t.Errorf("Get err = %v", err)
 	}
-	if err := h.Delete(ctx, rid); !errors.Is(err, context.Canceled) {
+	if err := h.del(ctx, rid); !errors.Is(err, context.Canceled) {
 		t.Errorf("Delete err = %v", err)
 	}
 	if _, _, _, err := h.Scan().Next(ctx); !errors.Is(err, context.Canceled) {
@@ -642,16 +735,65 @@ func heapRowSize(rng *rand.Rand) int {
 	case r < 97:
 		return 1 + rng.IntN(4000)
 	default:
-		return MaxTupleSize - rng.IntN(30)
+		return MaxRowData - rng.IntN(30)
 	}
 }
 
-func runHeapModel(t *testing.T, seed uint64, steps int) {
+// checkTuples walks every page of the heap and checks the forwarding
+// invariants: every stub points at a moved-in tuple of the heap that points
+// back, every moved-in tuple is pointed at by exactly one stub, and there is
+// never more than one hop. It returns the number of moved rows.
+func (h *Heap) checkTuples(t testing.TB) int {
+	t.Helper()
+	stubs := map[RID]RID{} // home -> moved-in tuple
+	moved := map[RID]RID{} // moved-in tuple -> home
+	for _, id := range h.Pages() {
+		err := withPage(bg, h.bp, id, false, false, func(sp *SlottedPage) (bool, error) {
+			for slot := sp.NextLive(0); slot >= 0; slot = sp.NextLive(slot + 1) {
+				rid := RID{Page: id, Slot: uint16(slot)}
+				tu, err := tupleAt(sp, rid)
+				if err != nil {
+					return false, err
+				}
+				switch tu.kind {
+				case tupleStub:
+					stubs[rid] = tu.link
+				case tupleMoved:
+					moved[rid] = tu.link
+				}
+			}
+			return false, nil
+		})
+		if err != nil {
+			t.Fatalf("page %d: %v", id, err)
+		}
+	}
+	if len(stubs) != len(moved) {
+		t.Fatalf("%d stubs, %d moved-in tuples", len(stubs), len(moved))
+	}
+	for home, at := range stubs {
+		if moved[at] != home {
+			t.Fatalf("stub %s points at %s, which points back at %s", home, at, moved[at])
+		}
+		if at.Page == home.Page {
+			t.Fatalf("row %s moved to its own page", home)
+		}
+	}
+	return len(stubs)
+}
+
+type modelRow struct {
+	data []byte
+	xid  uint64
+}
+
+func runHeapModel(t *testing.T, seed uint64, steps int) (movedRows int) {
 	t.Helper()
 	rng := rand.New(rand.NewPCG(seed, seed+21))
 	frames := 3 + rng.IntN(5)
 	e, h := newHeapEnv(t, frames)
-	model := map[RID][]byte{}
+	model := map[RID]modelRow{}
+	deleted := map[RID]uint64{} // tombstones and the deleter
 	pick := func() (RID, bool) {
 		if len(model) == 0 {
 			return RID{}, false
@@ -668,19 +810,56 @@ func runHeapModel(t *testing.T, seed uint64, steps int) {
 		})
 		return rids[rng.IntN(len(rids))], true
 	}
+	check := func(ctx string) {
+		t.Helper()
+		got := map[RID][]byte{}
+		s := h.Scan()
+		for {
+			rid, v, ok, err := s.Next(bg)
+			if err != nil {
+				t.Fatalf("%s: scan: %v", ctx, err)
+			}
+			if !ok {
+				break
+			}
+			if _, dup := got[rid]; dup {
+				t.Fatalf("%s: scan returned %s twice", ctx, rid)
+			}
+			if v.XID != model[rid].xid {
+				t.Fatalf("%s: row %s written by %d, model says %d", ctx, rid, v.XID, model[rid].xid)
+			}
+			got[rid] = v.Data
+		}
+		want := map[RID][]byte{}
+		for rid, r := range model {
+			want[rid] = r.data
+		}
+		sameRows(t, got, want, ctx)
+		movedRows = max(movedRows, h.checkTuples(t))
+		for rid, xid := range deleted {
+			tomb, err := h.readTuple(bg, rid)
+			if err != nil || tomb.kind != tupleTombstone || tomb.hdr.XID != xid {
+				t.Fatalf("%s: tombstone %s: %+v, %v", ctx, rid, tomb, err)
+			}
+		}
+	}
 	for step := range steps {
 		ctx := fmt.Sprintf("seed %d step %d", seed, step)
+		xid := uint64(step + 1)
 		switch op := rng.IntN(100); {
 		case op < 35:
 			d := rowBytes(rng, heapRowSize(rng))
-			rid, err := h.Insert(bg, d)
+			rid, err := h.Insert(bg, d, stampXID(xid))
 			if err != nil {
 				t.Fatalf("%s: Insert: %v", ctx, err)
 			}
 			if _, dup := model[rid]; dup {
 				t.Fatalf("%s: Insert returned live RID %s", ctx, rid)
 			}
-			model[rid] = d
+			if _, dup := deleted[rid]; dup {
+				t.Fatalf("%s: Insert reused the deleted row's slot %s", ctx, rid)
+			}
+			model[rid] = modelRow{d, xid}
 		case op < 60:
 			rid, ok := pick()
 			if !ok {
@@ -688,60 +867,68 @@ func runHeapModel(t *testing.T, seed uint64, steps int) {
 			}
 			d := rowBytes(rng, heapRowSize(rng))
 			old := model[rid]
-			newRID, err := h.Update(bg, rid, d)
+			var seen *Version
+			err := h.Update(bg, rid, d, func(r RID, v *Version) (RowHeader, error) {
+				if seen != nil || r != rid {
+					t.Fatalf("%s: stamp called twice, or for %s", ctx, r)
+				}
+				// v.Data is valid only during the call.
+				seen = &Version{RowHeader: v.RowHeader, Data: bytes.Clone(v.Data)}
+				return RowHeader{XID: xid, Undo: xid * 3}, nil
+			})
 			if err != nil {
 				t.Fatalf("%s: Update(%s): %v", ctx, rid, err)
 			}
-			if len(d) <= len(old) && newRID != rid {
-				t.Fatalf("%s: shrinking update moved the row %s -> %s", ctx, rid, newRID)
+			if seen == nil || seen.XID != old.xid || !bytes.Equal(seen.Data, old.data) {
+				t.Fatalf("%s: stamp did not see the old version", ctx)
 			}
-			if newRID != rid {
-				if _, taken := model[newRID]; taken {
-					t.Fatalf("%s: Update moved row onto live RID %s", ctx, newRID)
-				}
-				if _, err := h.Get(bg, rid); !errors.Is(err, ErrSlotNotFound) {
-					t.Fatalf("%s: old RID %s still readable (%v)", ctx, rid, err)
-				}
-				delete(model, rid)
+			model[rid] = modelRow{d, xid}
+			if v, err := h.Get(bg, rid); err != nil || v.XID != xid || v.Undo != xid*3 || !bytes.Equal(v.Data, d) {
+				t.Fatalf("%s: Get after update: %+v, %v", ctx, v.RowHeader, err)
 			}
-			model[newRID] = d
 		case op < 80:
 			rid, ok := pick()
 			if !ok {
 				continue
 			}
-			if err := h.Delete(bg, rid); err != nil {
+			if err := h.Delete(bg, rid, stampXID(xid)); err != nil {
 				t.Fatalf("%s: Delete(%s): %v", ctx, rid, err)
 			}
 			delete(model, rid)
-			if _, err := h.Get(bg, rid); !errors.Is(err, ErrSlotNotFound) {
+			deleted[rid] = xid
+			if _, err := h.get(bg, rid); !errors.Is(err, ErrRowDeleted) {
 				t.Fatalf("%s: deleted row readable: %v", ctx, err)
 			}
 		case op < 92:
 			if rid, ok := pick(); ok {
-				got, err := h.Get(bg, rid)
-				if err != nil || !bytes.Equal(got, model[rid]) {
+				got, err := h.get(bg, rid)
+				if err != nil || !bytes.Equal(got, model[rid].data) {
 					t.Fatalf("%s: Get(%s): %v", ctx, rid, err)
 				}
 			}
 			// A RID the model does not hold must not resolve.
 			probe := RID{Page: h.FirstPage(), Slot: uint16(rng.IntN(200))}
 			if _, live := model[probe]; !live {
-				if _, err := h.Get(bg, probe); !errors.Is(err, ErrSlotNotFound) {
+				want := ErrSlotNotFound
+				if _, gone := deleted[probe]; gone {
+					want = ErrRowDeleted
+				}
+				if _, err := h.get(bg, probe); !errors.Is(err, want) {
 					t.Fatalf("%s: Get(%s) err = %v for a row not in the model", ctx, probe, err)
 				}
 			}
 		case op < 98:
-			sameRows(t, scanAll(t, h), model, ctx+" scan")
+			check(ctx)
 			h.checkFSM(t)
 		default:
 			e, h = reopen(t, e, h, frames)
-			sameRows(t, scanAll(t, h), model, ctx+" after reopen")
+			check(ctx + " after reopen")
 		}
 		e.bp.checkInvariants(t, 0)
 	}
-	sameRows(t, scanAll(t, h), model, fmt.Sprintf("seed %d final", seed))
+	check(fmt.Sprintf("seed %d final", seed))
 	h.checkFSM(t)
+	return movedRows
 }
 
 func TestHeapModelBased(t *testing.T) {
@@ -750,8 +937,12 @@ func TestHeapModelBased(t *testing.T) {
 	if testing.Short() {
 		runs = 4
 	}
+	moved := 0
 	for i := range runs {
-		runHeapModel(t, base+uint64(i), steps)
+		moved += runHeapModel(t, base+uint64(i), steps)
+	}
+	if moved == 0 {
+		t.Fatal("no run moved a row")
 	}
 }
 
@@ -847,8 +1038,8 @@ func runHeapConcurrent(t *testing.T, frames, writers, scanners, opsPer int) {
 				switch op := rng.IntN(10); {
 				case op < 4 || len(rids) == 0:
 					d := concRow(byte(w), version, 9+rng.IntN(heapRowSize(rng)))
-					d = d[:min(len(d), MaxTupleSize)]
-					rid, err := retryBusy(func() (RID, error) { return h.Insert(bg, d) })
+					d = d[:min(len(d), MaxRowData)]
+					rid, err := retryBusy(func() (RID, error) { return h.put(bg, d) })
 					if err != nil {
 						t.Errorf("insert: %v", err)
 						return
@@ -861,24 +1052,22 @@ func runHeapConcurrent(t *testing.T, frames, writers, scanners, opsPer int) {
 				case op < 7:
 					rid := rids[rng.IntN(len(rids))]
 					d := concRow(byte(w), version, 9+rng.IntN(heapRowSize(rng)))
-					d = d[:min(len(d), MaxTupleSize)]
-					nr, err := retryBusy(func() (RID, error) { return h.Update(bg, rid, d) })
-					if err != nil {
+					d = d[:min(len(d), MaxRowData)]
+					if _, err := retryBusy(func() (struct{}, error) { return struct{}{}, h.set(bg, rid, d) }); err != nil {
 						t.Errorf("update: %v", err)
 						return
 					}
-					delete(m, rid)
-					m[nr] = d
+					m[rid] = d
 				case op < 9:
 					rid := rids[rng.IntN(len(rids))]
-					if _, err := retryBusy(func() (struct{}, error) { return struct{}{}, h.Delete(bg, rid) }); err != nil {
+					if _, err := retryBusy(func() (struct{}, error) { return struct{}{}, h.del(bg, rid) }); err != nil {
 						t.Errorf("delete: %v", err)
 						return
 					}
 					delete(m, rid)
 				default:
 					rid := rids[rng.IntN(len(rids))]
-					got, err := retryBusy(func() ([]byte, error) { return h.Get(bg, rid) })
+					got, err := retryBusy(func() ([]byte, error) { return h.get(bg, rid) })
 					if err != nil || !bytes.Equal(got, m[rid]) {
 						t.Errorf("get %s: %v (own row changed or lost)", rid, err)
 						return
@@ -910,7 +1099,7 @@ func runHeapConcurrent(t *testing.T, frames, writers, scanners, opsPer int) {
 // retryRow is Scanner.Next with the busy-pool retry.
 func retryRow(s *Scanner) (RID, []byte, bool, error) {
 	for {
-		rid, d, ok, err := s.Next(bg)
+		rid, d, ok, err := s.nextData(bg)
 		if !errors.Is(err, ErrNoFreeFrames) {
 			return rid, d, ok, err
 		}
@@ -928,7 +1117,7 @@ func TestHeapConcurrentSharedRows(t *testing.T) {
 	const rows, workers, iters, size = 40, 6, 400, 600
 	rids := make([]RID, rows)
 	for i := range rids {
-		rid, err := h.Insert(bg, concRow(0, 0, size))
+		rid, err := h.put(bg, concRow(0, 0, size))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -951,13 +1140,13 @@ func TestHeapConcurrentSharedRows(t *testing.T) {
 					vmu.Unlock()
 					// Writers race: only the final bytes matter, and they
 					// must be one writer's complete row.
-					got, err := retryBusy(func() (RID, error) { return h.Update(bg, rids[i], concRow(byte(w), v, size)) })
-					if err != nil || got != rids[i] {
-						t.Errorf("in-place update of %s: moved to %s, %v", rids[i], got, err)
+					_, err := retryBusy(func() (struct{}, error) { return struct{}{}, h.set(bg, rids[i], concRow(byte(w), v, size)) })
+					if err != nil {
+						t.Errorf("in-place update of %s: %v", rids[i], err)
 						return
 					}
 				} else {
-					d, err := retryBusy(func() ([]byte, error) { return h.Get(bg, rids[i]) })
+					d, err := retryBusy(func() ([]byte, error) { return h.get(bg, rids[i]) })
 					if err != nil {
 						t.Errorf("get: %v", err)
 						return
@@ -979,33 +1168,50 @@ func TestHeapConcurrentSharedRows(t *testing.T) {
 	e.bp.checkInvariants(t, 0)
 }
 
-// The heap must work with the smallest pools: it never needs more than one
-// page pinned at a time.
-func TestHeapWithOneAndTwoFrames(t *testing.T) {
-	for _, frames := range []int{1, 2} {
+// The heap must work with the smallest pools. A row operation pins at most
+// three pages (moving a moved row again); with fewer frames, everything but
+// moves works, and a move fails cleanly.
+func TestHeapWithTinyPools(t *testing.T) {
+	for _, frames := range []int{1, 2, 3} {
 		t.Run(fmt.Sprintf("frames=%d", frames), func(t *testing.T) {
 			e, h := newHeapEnv(t, frames)
 			rng := rand.New(rand.NewPCG(uint64(frames), 4))
 			want := map[RID][]byte{}
 			for range 200 {
 				d := rowBytes(rng, 1+rng.IntN(2500))
-				rid, err := h.Insert(bg, d)
+				rid, err := h.put(bg, d)
 				if err != nil {
 					t.Fatal(err)
 				}
 				want[rid] = d
 			}
-			for rid, d := range want { // update half so some rows move
-				if rng.IntN(2) == 0 {
-					nd := rowBytes(rng, 1+rng.IntN(3000))
-					nr, err := h.Update(bg, rid, nd)
-					if err != nil {
-						t.Fatal(err)
-					}
-					delete(want, rid)
-					want[nr] = nd
-					_ = d
+			for rid, d := range want { // update half; with three frames some rows move
+				if rng.IntN(2) != 0 {
+					continue
 				}
+				nd := rowBytes(rng, 1+rng.IntN(3000))
+				if frames < 3 {
+					nd = rowBytes(rng, len(d)) // same size: always in place
+				}
+				if err := h.set(bg, rid, nd); err != nil {
+					t.Fatal(err)
+				}
+				want[rid] = nd
+			}
+			if frames == 1 {
+				// A move needs two pages pinned: refused, nothing changed.
+				for rid, d := range want {
+					if err := h.set(bg, rid, bytes.Repeat([]byte{5}, MaxRowData)); !errors.Is(err, ErrNoFreeFrames) {
+						t.Fatalf("move with one frame: %v", err)
+					}
+					if got, err := h.get(bg, rid); err != nil || !bytes.Equal(got, d) {
+						t.Fatalf("row changed by a refused move: %v", err)
+					}
+					break
+				}
+			}
+			if frames == 3 && h.checkTuples(t) == 0 {
+				t.Fatal("no row moved")
 			}
 			sameRows(t, scanAll(t, h), want, "scan")
 			h.checkFSM(t)
@@ -1054,7 +1260,7 @@ func runHeapCrash(t *testing.T, seed uint64) {
 		switch op := rng.IntN(100); {
 		case op < 50:
 			d := rowBytes(rng, heapRowSize(rng))
-			rid, err := h.Insert(bg, d)
+			rid, err := h.put(bg, d)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1062,17 +1268,15 @@ func runHeapCrash(t *testing.T, seed uint64) {
 		case op < 70 && len(model) > 0:
 			for rid := range model { // any row
 				d := rowBytes(rng, heapRowSize(rng))
-				nr, err := h.Update(bg, rid, d)
-				if err != nil {
+				if err := h.set(bg, rid, d); err != nil {
 					t.Fatal(err)
 				}
-				delete(model, rid)
-				model[nr] = d
+				model[rid] = d
 				break
 			}
 		case op < 85 && len(model) > 0:
 			for rid := range model {
-				if err := h.Delete(bg, rid); err != nil {
+				if err := h.del(bg, rid); err != nil {
 					t.Fatal(err)
 				}
 				delete(model, rid)
@@ -1128,7 +1332,7 @@ func BenchmarkHeapInsert(b *testing.B) {
 	row := bytes.Repeat([]byte{1}, 100)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := h.Insert(bg, row); err != nil {
+		if _, err := h.put(bg, row); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1142,7 +1346,7 @@ func BenchmarkHeapScan(b *testing.B) {
 	}
 	row := bytes.Repeat([]byte{1}, 100)
 	for range 5000 {
-		if _, err := h.Insert(bg, row); err != nil {
+		if _, err := h.put(bg, row); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -1151,7 +1355,7 @@ func BenchmarkHeapScan(b *testing.B) {
 		s := h.Scan()
 		n := 0
 		for {
-			_, _, ok, err := s.Next(bg)
+			_, _, ok, err := s.nextData(bg)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -1174,7 +1378,7 @@ func TestHeapPagesFollowTheChain(t *testing.T) {
 	}
 	pages := map[uint64]bool{}
 	for i := range 200 {
-		rid, err := h.Insert(bg, bytes.Repeat([]byte{byte(i)}, 300))
+		rid, err := h.put(bg, bytes.Repeat([]byte{byte(i)}, 300))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1193,5 +1397,66 @@ func TestHeapPagesFollowTheChain(t *testing.T) {
 	_, h = reopen(t, e, h, frames)
 	if again := h.Pages(); !slices.Equal(again, got) {
 		t.Fatalf("after reopening: %v, want %v", again, got)
+	}
+}
+
+// A forward stub must lead to a moved-in tuple that points back at it. Two
+// moved rows whose stubs are swapped (a damaged page) are corrupt: neither
+// row reads the other's data, and nothing loops.
+func TestSwappedForwardStubsAreCorrupt(t *testing.T) {
+	_, h := newHeapEnv(t, 8)
+	a, err := h.put(bg, []byte("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := h.put(bg, []byte("b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.fillPage(t, 0, 9)
+	for _, rid := range []RID{a, b} {
+		if err := h.set(bg, rid, bytes.Repeat([]byte{byte(rid.Slot)}, 3000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sa, _ := h.readTuple(bg, a)
+	sb, _ := h.readTuple(bg, b)
+	if sa.kind != tupleStub || sb.kind != tupleStub {
+		t.Fatal("setup: rows did not move")
+	}
+	err = withPage(bg, h.bp, a.Page, true, false, func(sp *SlottedPage) (bool, error) {
+		if err := sp.Update(int(a.Slot), rowTuple{kind: tupleStub, link: sb.link}.encode()); err != nil {
+			return false, err
+		}
+		return true, sp.Update(int(b.Slot), rowTuple{kind: tupleStub, link: sa.link}.encode())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rid := range []RID{a, b} {
+		if _, err := h.get(bg, rid); !errors.Is(err, ErrCorruptHeap) {
+			t.Fatalf("Get(%s) through a swapped stub: %v", rid, err)
+		}
+		if err := h.set(bg, rid, []byte("x")); !errors.Is(err, ErrCorruptHeap) {
+			t.Fatalf("Update(%s) through a swapped stub: %v", rid, err)
+		}
+		if err := h.del(bg, rid); !errors.Is(err, ErrCorruptHeap) {
+			t.Fatalf("Delete(%s) through a swapped stub: %v", rid, err)
+		}
+	}
+}
+
+// A move never picks the row's own pages, even when only they have room.
+func TestPickPageExceptSkipsPages(t *testing.T) {
+	_, h := newHeapEnv(t, 4)
+	if err := h.growUnlogged(bg); err != nil {
+		t.Fatal(err)
+	}
+	ids := h.Pages()
+	if _, ok := h.pickPageExcept(100, ids...); ok {
+		t.Fatal("picked a skipped page")
+	}
+	if got, ok := h.pickPageExcept(100, ids[0]); !ok || got != ids[1] {
+		t.Fatalf("picked %d, %v; want %d", got, ok, ids[1])
 	}
 }

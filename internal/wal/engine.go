@@ -24,14 +24,18 @@ const (
 
 // EngineOptions configures an Engine.
 type EngineOptions struct {
-	// Frames is the buffer pool size, at least 2 (logged heaps change up
-	// to two pages at once). Zero means 256.
+	// Frames is the buffer pool size, at least 4: a row write pins up to
+	// two heap pages while its undo record pins up to two undo pages
+	// (docs/design/15-row-versioning.md). Zero means 256.
 	Frames int
 	// WAL configures the log.
 	WAL Options
 }
 
-const defaultFrames = 256
+const (
+	defaultFrames = 256
+	minFrames     = 4
+)
 
 // RecoveryStats describes what OpenEngine's recovery did.
 type RecoveryStats struct {
@@ -84,6 +88,10 @@ type Engine struct {
 	// horizon is the writing transaction's begin LSN, 0 if none: pages
 	// with a higher LSN were changed by it and must not reach disk yet.
 	horizon atomic.Uint64
+
+	// keepUndo turns off the interim release of a transaction's undo at
+	// commit (Txn.Commit), for this package's tests of the undo log itself.
+	keepUndo bool
 }
 
 // OpenEngine opens the database in dir, creating it if it does not exist,
@@ -95,8 +103,8 @@ func OpenEngine(ctx context.Context, fsys vfs.FS, dir string, opts EngineOptions
 	if opts.Frames == 0 {
 		opts.Frames = defaultFrames
 	}
-	if opts.Frames < 2 {
-		return nil, fmt.Errorf("opening engine: %d frames, need at least 2: %w", opts.Frames, ErrInvalidOptions)
+	if opts.Frames < minFrames {
+		return nil, fmt.Errorf("opening engine: %d frames, need at least %d: %w", opts.Frames, minFrames, ErrInvalidOptions)
 	}
 	e := &Engine{fsys: fsys, dir: dir, nextXID: 1, active: map[XID]struct{}{}, outcomes: map[XID]outcome{}}
 	if err := e.open(ctx, opts); err != nil {

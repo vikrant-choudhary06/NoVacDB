@@ -265,7 +265,12 @@ func TestOpenRejectsDamagedLogs(t *testing.T) {
 		}, ErrBadMagic},
 		{"future version", func(t *testing.T, m *vfs.MemFS, s []segFile) {
 			d := readFile(t, m, name(s[1]))
-			copy(d, reseal(d[:SegmentHeaderSize], func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 4) }))
+			copy(d, reseal(d[:SegmentHeaderSize], func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 5) }))
+			writeFile(t, m, name(s[1]), d)
+		}, ErrUnsupportedVersion},
+		{"version 3 log", func(t *testing.T, m *vfs.MemFS, s []segFile) {
+			d := readFile(t, m, name(s[1]))
+			copy(d, reseal(d[:SegmentHeaderSize], func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 3) }))
 			writeFile(t, m, name(s[1]), d)
 		}, ErrUnsupportedVersion},
 		{"version 2 log", func(t *testing.T, m *vfs.MemFS, s []segFile) {

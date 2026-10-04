@@ -41,9 +41,9 @@ const (
 	BlockSetNext
 )
 
-// maxHeapBlocks is the most pages one heap operation changes (moving a row,
-// growing the heap).
-const maxHeapBlocks = 2
+// maxHeapBlocks is the most pages one heap operation changes: moving a
+// moved row again changes three (docs/design/15-row-versioning.md 2.2).
+const maxHeapBlocks = 3
 
 // HeapBlock is the part of a heap record about one page.
 type HeapBlock struct {
@@ -57,7 +57,7 @@ type HeapBlock struct {
 // Heap record payload layout (little-endian):
 //
 //	offset  size  field
-//	0       1     BlockCount (1 or 2)
+//	0       1     BlockCount (1 to 3)
 //	1       ...   blocks, back to back
 //
 // Block:

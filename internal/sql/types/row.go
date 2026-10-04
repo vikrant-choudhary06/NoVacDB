@@ -27,8 +27,9 @@ const (
 	MaxColumns = 1600
 )
 
-// MaxRowSize is the largest encoded row: one heap tuple.
-const MaxRowSize = storage.MaxTupleSize
+// MaxRowSize is the largest encoded row (docs/design/15-row-versioning.md
+// section 2.6).
+const MaxRowSize = storage.MaxRowData
 
 // EncodeRow encodes a row of values of the given column types. Each value
 // must be NULL or have its column's type. A row larger than MaxRowSize is

@@ -149,14 +149,14 @@ func checkConsistency(t testing.TB, db *DB) {
 		live := map[storage.RID][]types.Value{}
 		s := tbl.Heap.Scan()
 		for {
-			rid, data, ok, err := s.Next(bg)
+			rid, v, ok, err := s.Next(bg)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !ok {
 				break
 			}
-			row, err := types.DecodeRow(data, tbl.Types())
+			row, err := types.DecodeRow(v.Data, tbl.Types())
 			if err != nil {
 				t.Fatalf("table %s row %v: %v", tbl.Name, rid, err)
 			}

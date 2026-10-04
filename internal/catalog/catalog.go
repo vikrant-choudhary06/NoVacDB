@@ -162,14 +162,14 @@ func corruptCatalog(format string, args ...any) *sqlerr.Error {
 func (c *Catalog) scanSys(ctx context.Context, which int, fn func(rid storage.RID, row []types.Value) error) error {
 	s := c.sys[which].Scan()
 	for {
-		rid, data, ok, err := s.Next(ctx)
+		rid, v, ok, err := s.Next(ctx)
 		if err != nil {
 			return err
 		}
 		if !ok {
 			return nil
 		}
-		row, err := types.DecodeRow(data, sysTypes[which])
+		row, err := types.DecodeRow(v.Data, sysTypes[which])
 		if err != nil {
 			return corruptCatalog("%s row %s: %v", sysNames[which], rid, err)
 		}

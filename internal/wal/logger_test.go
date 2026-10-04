@@ -146,7 +146,7 @@ func replayLog(t testing.TB, fsys vfs.FS, pageCount uint64, from LSN) map[uint64
 }
 
 func TestLoggedHeapWithRealLog(t *testing.T) {
-	for _, frames := range []int{2, 4, 16} {
+	for _, frames := range []int{3, 4, 16} {
 		t.Run(fmt.Sprintf("frames=%d", frames), func(t *testing.T) {
 			s := newLoggedSetup(t, frames, 4096)
 			rng := rand.New(rand.NewPCG(testSeed(t), uint64(frames)))
@@ -158,21 +158,20 @@ func TestLoggedHeapWithRealLog(t *testing.T) {
 			for i := range 800 {
 				switch op := rng.IntN(10); {
 				case op < 5 || len(rids) == 0:
-					rid, err := h.Insert(bg, payload(rng, 1+rng.IntN(3000)))
+					rid, err := heapInsert(h, payload(rng, 1+rng.IntN(3000)))
 					if err != nil {
 						t.Fatal(err)
 					}
 					rids = append(rids, rid)
 				case op < 8:
 					j := rng.IntN(len(rids))
-					nr, err := h.Update(bg, rids[j], payload(rng, 1+rng.IntN(5000)))
+					err := heapUpdate(h, rids[j], payload(rng, 1+rng.IntN(5000)))
 					if err != nil {
 						t.Fatal(err)
 					}
-					rids[j] = nr
 				default:
 					j := rng.IntN(len(rids))
-					if err := h.Delete(bg, rids[j]); err != nil {
+					if err := heapDelete(h, rids[j]); err != nil {
 						t.Fatal(err)
 					}
 					rids = append(rids[:j], rids[j+1:]...)
@@ -250,7 +249,7 @@ func TestImageRuleHoldsUnderConcurrentCheckpoints(t *testing.T) {
 			var mine []storage.RID
 			for range 200 {
 				if len(mine) == 0 || rng.IntN(3) > 0 {
-					rid, err := h.Insert(bg, payload(rng, 1+rng.IntN(600)))
+					rid, err := heapInsert(h, payload(rng, 1+rng.IntN(600)))
 					if err != nil {
 						t.Errorf("insert: %v", err)
 						return
@@ -258,12 +257,11 @@ func TestImageRuleHoldsUnderConcurrentCheckpoints(t *testing.T) {
 					mine = append(mine, rid)
 				} else {
 					j := rng.IntN(len(mine))
-					nr, err := h.Update(bg, mine[j], payload(rng, 1+rng.IntN(1500)))
+					err := heapUpdate(h, mine[j], payload(rng, 1+rng.IntN(1500)))
 					if err != nil {
 						t.Errorf("update: %v", err)
 						return
 					}
-					mine[j] = nr
 				}
 			}
 		}()
@@ -326,7 +324,7 @@ func TestLoggerFailureUndoesChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rid, err := h.Insert(bg, []byte("kept"))
+	rid, err := heapInsert(h, []byte("kept"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,13 +337,13 @@ func TestLoggerFailureUndoesChange(t *testing.T) {
 	if err := s.w.Flush(bg); err == nil {
 		t.Fatal("flush unexpectedly succeeded")
 	}
-	if _, err := h.Insert(bg, []byte("lost")); !errors.Is(err, ErrFailed) {
+	if _, err := heapInsert(h, []byte("lost")); !errors.Is(err, ErrFailed) {
 		t.Fatalf("insert on a failed log: %v", err)
 	}
-	if err := h.Delete(bg, rid); !errors.Is(err, ErrFailed) {
+	if err := heapDelete(h, rid); !errors.Is(err, ErrFailed) {
 		t.Fatalf("delete on a failed log: %v", err)
 	}
-	got, err := h.Get(bg, rid)
+	got, err := heapGet(h, rid)
 	if err != nil || string(got) != "kept" {
 		t.Fatalf("row after failed operations: %q, %v", got, err)
 	}

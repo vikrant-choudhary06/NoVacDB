@@ -69,7 +69,7 @@ func value(typ types.Type, n int, nullable bool) types.Value {
 // insert adds up to n rows to a table and its indexes, as the executor
 // will, skipping rows that would duplicate a unique key. It returns how many
 // it added.
-func (r *rdb) insert(tbl *Table, n int) (int, error) {
+func (r *rdb) insert(xid wal.XID, tbl *Table, n int) (int, error) {
 	added := 0
 next:
 	for range n {
@@ -96,7 +96,7 @@ next:
 		if err != nil {
 			return added, err
 		}
-		rid, err := tbl.Heap.Insert(bg, data)
+		rid, err := r.d.c.writer(xid).Insert(bg, tbl.Heap, data)
 		if err != nil {
 			return added, err
 		}
@@ -124,7 +124,7 @@ func (r *rdb) randomTable() *Table {
 
 // op runs one random change and returns the pages to free at commit, and
 // how the row counts change.
-func (r *rdb) op(rows map[string]int) ([]uint64, error) {
+func (r *rdb) op(xid wal.XID, rows map[string]int) ([]uint64, error) {
 	c := r.d.c
 	switch k := r.rng.IntN(10); {
 	case k < 3 || len(c.Tables()) == 0:
@@ -139,14 +139,14 @@ func (r *rdb) op(rows map[string]int) ([]uint64, error) {
 		if n := len(def.Columns); n > 1 && r.rng.IntN(3) == 0 {
 			def.Unique = [][]string{{"c" + strconv.Itoa(n-1), "c0"}}
 		}
-		_, err := c.CreateTable(bg, def)
+		_, err := c.CreateTable(bg, xid, def)
 		if err == nil {
 			rows[def.Name] = 0
 		}
 		return nil, err
 	case k < 6:
 		tbl := r.randomTable()
-		n, err := r.insert(tbl, 1+r.rng.IntN(60))
+		n, err := r.insert(xid, tbl, 1+r.rng.IntN(60))
 		if err != nil {
 			return nil, err
 		}
@@ -155,17 +155,17 @@ func (r *rdb) op(rows map[string]int) ([]uint64, error) {
 	case k < 8:
 		tbl := r.randomTable()
 		col := tbl.Columns[r.rng.IntN(len(tbl.Columns))].Name
-		_, err := c.CreateIndex(bg, tbl, "", []string{col}, r.rng.IntN(2) == 0)
+		_, err := c.CreateIndex(bg, xid, tbl, "", []string{col}, r.rng.IntN(2) == 0)
 		return nil, err
 	case k < 9:
 		tbl := r.randomTable()
 		if len(tbl.Indexes) == 0 {
 			return nil, nil
 		}
-		return c.DropIndex(bg, tbl.Indexes[r.rng.IntN(len(tbl.Indexes))])
+		return c.DropIndex(bg, xid, tbl.Indexes[r.rng.IntN(len(tbl.Indexes))])
 	default:
 		tbl := r.randomTable()
-		pages, err := c.DropTable(bg, tbl)
+		pages, err := c.DropTable(bg, xid, tbl)
 		if err == nil {
 			delete(rows, tbl.Name)
 		}
@@ -189,7 +189,7 @@ func (r *rdb) statement(crash bool) (sqlErrors int) {
 		var pages []uint64
 		err := tx.Write(bg, func(context.Context) error {
 			var err error
-			pages, err = r.op(rows)
+			pages, err = r.op(tx.XID(), rows)
 			var se *sqlerr.Error
 			if errors.As(err, &se) {
 				return wal.Unchanged(err) // the catalog's rule: nothing changed
@@ -252,14 +252,14 @@ func (r *rdb) verify() {
 		live := map[storage.RID][]types.Value{}
 		s := tbl.Heap.Scan()
 		for {
-			rid, data, ok, err := s.Next(bg)
+			rid, v, ok, err := s.Next(bg)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !ok {
 				break
 			}
-			row, err := types.DecodeRow(data, tbl.Types())
+			row, err := types.DecodeRow(v.Data, tbl.Types())
 			if err != nil {
 				t.Fatalf("table %s row %v: %v", tbl.Name, rid, err)
 			}

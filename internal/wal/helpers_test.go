@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/vikrant-choudhary06/NoVacDB/internal/storage"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/vfs"
 )
 
@@ -216,3 +217,30 @@ func sameRecs(t testing.TB, got, want []logRec, ctx string) {
 }
 
 func crc32c(b []byte) uint32 { return crc32.Checksum(b, castagnoli) }
+
+// Heap helpers for tests about logging and recovery, not row versions:
+// every write is stamped with transaction 1 and no undo.
+
+var stamp1 storage.Stamper = func(storage.RID, *storage.Version) (storage.RowHeader, error) {
+	return storage.RowHeader{XID: 1}, nil
+}
+
+func heapInsert(h *storage.Heap, data []byte) (storage.RID, error) {
+	return h.Insert(bg, data, stamp1)
+}
+
+func heapUpdate(h *storage.Heap, rid storage.RID, data []byte) error {
+	return h.Update(bg, rid, data, stamp1)
+}
+
+func heapDelete(h *storage.Heap, rid storage.RID) error { return h.Delete(bg, rid, stamp1) }
+
+func heapGet(h *storage.Heap, rid storage.RID) ([]byte, error) {
+	v, err := h.Get(bg, rid)
+	return v.Data, err
+}
+
+func heapNext(s *storage.Scanner) (storage.RID, []byte, bool, error) {
+	rid, v, ok, err := s.Next(bg)
+	return rid, v.Data, ok, err
+}

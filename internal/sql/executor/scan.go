@@ -228,11 +228,11 @@ func (st *stmt) scan(tbl *catalog.Table, a access, where node, fn func(rid stora
 	if a.ix == nil {
 		s := tbl.Heap.Scan()
 		for {
-			rid, data, ok, err := s.Next(st.ctx)
+			rid, v, ok, err := s.Next(st.ctx)
 			if err != nil || !ok {
 				return err
 			}
-			if more, err := visit(rid, data); err != nil || !more {
+			if more, err := visit(rid, v.Data); err != nil || !more {
 				return err
 			}
 		}
@@ -248,11 +248,13 @@ func (st *stmt) scan(tbl *catalog.Table, a access, where node, fn func(rid stora
 		if err != nil {
 			return err
 		}
-		data, err := tbl.Heap.Get(st.ctx, rid)
+		// Index entries are removed with their row (until Step 6.7), so an
+		// entry never names a deleted row.
+		row, err := tbl.Heap.Get(st.ctx, rid)
 		if err != nil {
 			return err
 		}
-		if more, err := visit(rid, data); err != nil || !more {
+		if more, err := visit(rid, row.Data); err != nil || !more {
 			return err
 		}
 	}

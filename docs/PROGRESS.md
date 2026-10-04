@@ -8,7 +8,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 
 ## Current step
 
-👉 **Step 6.3 — In-place updates with row versioning** (design doc `15-row-versioning.md` awaiting review)
+👉 **Step 6.4 — Snapshots and visibility** (design doc `16-snapshots-visibility.md` first)
 
 ---
 
@@ -19,6 +19,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 | 2026-10-03 | 6.0 B+Tree review follow-ups | ✅ Done | Every item was already done by B+Tree design revision 2 (commits `d1f85dd`, `5b5e6d3`): leaf cell `Flags` byte with data format version 2; deferred frees logged (WAL type 6), re-logged by checkpoints and replayed by recovery, with crash tests; the deadlock-freedom argument in `08-btree.md` section 2.9 corrected and `TestConcurrentLeftSiblingRepairs` added; full-page images (problem #8 stays open) and root X-latching in the Limitations. Checked again against the code and docs; nothing left to do. |
 | 2026-10-03 | 6.1 Transaction manager | ✅ Done | Design doc `13-transactions.md` (reviewed and approved, including WAL format version 2). 64-bit transaction IDs allocated on the first write and never reused (`NextXID` in checkpoint records, recovered as the maximum of checkpoints and logged IDs); `TxnBegin`/`TxnCommit` records (types 7, 8) replace statement groups; a status table (active, committed, aborted, resolved, unknown) bounded to two checkpoint intervals; `wal.Txn` and executor `Tx` with `Begin`/`Exec`/`ExecPrepared`/`Commit`/`Rollback`, autocommit for everything else, `25P02` after a failure. Interim until undo, versions and locks: one writing transaction at a time holding the exclusive lock, rollback by reopening, size bounded by the pool. Recovery's first pass now refuses unknown record types anywhere (found by a test for the reserved type). Model-checked random transactions with crashes; crash harness with transactions (3000 scenarios: about 11k commits, 2.8k rollbacks, 3.7k open at a crash, all matched); `FuzzTxnRecovery`. 40 deliberate-bug checks: 38 caught (4 after new tests, one of which showed a test passing by accident), 2 found redundant code (removed). |
 | 2026-10-03 | 6.2 Undo log | ✅ Done | Design doc `14-undo-log.md` (reviewed and approved, including data format version 3 with undo pages, type 6, and WAL format version 3 with `Undo` and `UndoSegment` records, types 10 and 11). New package `internal/undo`: one segment of undo pages per transaction in the data file; 54-byte record header plus the full previous row image (at most 8090 bytes; Step 6.3 lowers the maximum row to 8000); undo pointers are page × 8192 + offset; `Append` sets the transaction chain itself; every page and record validated on read. Undo pages follow the existing WAL rules (images after a redo point, no steal, deferred frees on release). The segment table is logged on add and drop and logged again by every checkpoint; recovery rebuilds it and follows each segment's pages. Tests: golden bytes, every truncation, `FuzzUndoRecord` and `FuzzDecodeBlocks`, a model test of row chains across 60 transactions, replay byte-for-byte and from a redo point with torn pages, engine crash tests (40 runs with torn writes, in-flight transactions, releases), the table surviving log trimming, released pages freed after a crash. 33 deliberate-bug checks in about 1.5 minutes: 29 caught at first, the other 4 after 3 new test cases and the removal of a duplicate check. |
+| 2026-10-04 | 6.3 In-place updates with row versioning | ✅ Done | Design doc `15-row-versioning.md` (reviewed and approved, including data format version 4, a header on every heap row, and WAL format version 4, heap records of up to three blocks). Every row carries the transaction that last wrote it and an undo pointer; `UPDATE` saves the old version to the undo log and changes the row in place; a row that outgrows its page moves and leaves an 18-byte forward stub, so its RID never changes (one hop at most, moving home again when it fits); `DELETE` leaves an 18-byte tombstone; `INSERT` writes an undo record. New package `internal/mvcc` (undo first, then the row, through a `Stamper` callback). Maximum row 8000 bytes. Interim until Step 6.4: undo released at commit. Tests: golden bytes and `FuzzRowHeader`, a heap model test with forwarding invariants (it found that a 12-byte stub could not always become a tombstone), an mvcc model test checking every changed row's undo chain before commit with crashes, 10,000 updates of one row without table or file growth, row size limits, SQL crash workload with rows that move. 30 deliberate-bug checks: 27 caught (4 after new tests), 3 unreachable defensive checks kept. |
 
 ---
 
@@ -116,7 +117,7 @@ flowchart TB
 
 ---
 
-### 👉 Step 6.3 — In-place updates with row versioning
+### ✅ Step 6.3 — In-place updates with row versioning
 
 **Goal:** The core difference from PostgreSQL: rows change where they are.
 
@@ -131,7 +132,7 @@ flowchart TB
 
 ---
 
-### ⬜ Step 6.4 — Snapshots and visibility
+### 👉 Step 6.4 — Snapshots and visibility
 
 **Goal:** Every reader sees a consistent picture of the data.
 

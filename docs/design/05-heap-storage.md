@@ -1,6 +1,6 @@
 # 05 — Slotted Pages and Heap Tables (`internal/storage`)
 
-Status: **Implemented (Step 1.4); written and approved under the standing autonomous-mode instruction**
+Status: **Implemented (Step 1.4); written and approved under the standing autonomous-mode instruction.** Since Step 6.3, every heap tuple carries a row header, and rows keep their RID when they move (forward stubs), are deleted as tombstones and are at most 8000 bytes: see 15-row-versioning.md. The slotted-page layer below is unchanged.
 
 ## 1. Problem
 

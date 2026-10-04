@@ -23,4 +23,4 @@ Failure & crash, Alternatives, Testing plan, Limitations.
 | [12](12-wire-protocol.md) | PostgreSQL wire protocol (`internal/pgwire`, `internal/server`) | Implemented (Phase 5 complete) |
 | [13](13-transactions.md) | Transactions (`internal/wal`, `internal/sql/executor`) | Step 6.1 implemented |
 | [14](14-undo-log.md) | Undo log (`internal/undo`, `internal/wal`) | Step 6.2 implemented |
-| [15](15-row-versioning.md) | Row versioning (`internal/storage`, `internal/mvcc`) | Step 6.3 designed, awaiting review |
+| [15](15-row-versioning.md) | Row versioning (`internal/storage`, `internal/mvcc`) | Step 6.3 implemented |

@@ -32,7 +32,7 @@ Operations that touch two pages are **one record**:
 
 A single record is atomic under the WAL rule. If it is durable, recovery replays every block. If it is not, no page carrying its effects can have reached disk, because each changed page carries the record's LSN. (Step 1.4 implemented the move as insert-then-delete. Without a log that could duplicate a row after a crash; with the log it cannot.)
 
-Logged heaps therefore need at least two buffer frames: a two-page operation pins and exclusively latches both pages, always in ascending page-ID order so two operations can never deadlock. Unlogged heaps (no logger, the Step 1.4 behaviour kept for tests) are unchanged.
+Logged heaps therefore need at least three buffer frames: a multi-page operation (up to three pages since Step 6.3, 15-row-versioning.md section 2.2) pins and exclusively latches all its pages, always in ascending page-ID order so two operations can never deadlock. Unlogged heaps (no logger, the Step 1.4 behaviour kept for tests) are unchanged.
 
 **Order of work for one operation**, done while holding the exclusive latch of every page involved:
 
@@ -148,7 +148,7 @@ All integers little-endian.
 
 | offset | size | field | notes |
 |---|---|---|---|
-| 0 | 1 | BlockCount | 1 or 2 |
+| 0 | 1 | BlockCount | 1 to 3 (1 or 2 before WAL format 4) |
 | 1 | … | blocks | back to back |
 
 Block:
@@ -167,7 +167,7 @@ Block:
 | delete (4) | u16 slot |
 | set-next (5) | u64 next page ID |
 
-A block's page ID must be at least 2, two blocks must name different pages, the tuple length must be 1..`MaxTupleSize`, and nothing may follow the last block.
+A block's page ID must be at least 2, blocks must name different pages, the tuple length must be 1..`MaxTupleSize`, and nothing may follow the last block.
 
 **Checkpoint record payload** (type 2): u64 redo LSN.
 
@@ -245,4 +245,4 @@ A block's page ID must be at least 2, two blocks must name different pages, the 
 - Full-page images make the log larger after each checkpoint (WORKFLOW problem #8 is not fixed).
 - Pages leaked by a crash between allocating and logging are never reclaimed (needs a consistency checker).
 - The engine does not know which heaps exist (catalog, Step 4.4).
-- Logged heaps need at least two buffer frames.
+- Logged heaps need at least three buffer frames, and the engine at least four (a row write also pins up to two undo pages).

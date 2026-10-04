@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,14 +20,23 @@ const failSetup = `CREATE TABLE other (x int, pad text);
 	CREATE TABLE t (id int PRIMARY KEY, v text, n int);
 	CREATE INDEX ON t (n, v)`
 
+// failData fills the tables, in statements of 40 rows: the tests replay it
+// for every injected fault, and what they examine is the statement after
+// it. The pages it changes stay dirty in the small pool (failOpts), so the
+// statement under test still has to evict them.
 func failData(t *testing.T, db *DB) {
 	t.Helper()
-	for i := range 200 {
-		mustExec(t, db, fmt.Sprintf("INSERT INTO other VALUES (%d, '%0300d')", i, i))
+	insert := func(n int, row func(i int) string, table string) {
+		for lo := 0; lo < n; lo += 40 {
+			var vals []string
+			for i := lo; i < min(lo+40, n); i++ {
+				vals = append(vals, row(i))
+			}
+			mustExec(t, db, "INSERT INTO "+table+" VALUES "+strings.Join(vals, ", "))
+		}
 	}
-	for i := range 120 {
-		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, 'v%d', %d)", i, i, i%7))
-	}
+	insert(200, func(i int) string { return fmt.Sprintf("(%d, '%0300d')", i, i) }, "other")
+	insert(120, func(i int) string { return fmt.Sprintf("(%d, 'v%d', %d)", i, i, i%7) }, "t")
 }
 
 func TestSelfRestartAfterIOFailure(t *testing.T) {
@@ -400,7 +410,9 @@ func TestDroppedPagesAreFreedAfterACrash(t *testing.T) {
 	dropped := uint64(len(gone.Heap.Pages()) + len(pages))
 	free := db.e.FreePageCount()
 	mustExec(t, db, "DROP TABLE gone")
-	if db.e.FreePageCount() != free {
+	// The DROP's undo records may take pages off the free list; nothing may
+	// be freed before a checkpoint.
+	if db.e.FreePageCount() > free {
 		t.Fatal("pages were freed before a checkpoint")
 	}
 	// The power goes before any checkpoint: the request is in the log.

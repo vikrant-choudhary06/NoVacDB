@@ -66,10 +66,10 @@ func (d *db) close(t *testing.T) {
 
 // stmt runs fn in a statement group and commits it. If fn fails the
 // engine is abandoned, as the executor does.
-func (d *db) stmt(t *testing.T, fn func() error) error {
+func (d *db) stmt(t *testing.T, fn func(xid wal.XID) error) error {
 	t.Helper()
 	tx := d.e.Begin()
-	if err := tx.Write(bg, func(context.Context) error { return fn() }); err != nil {
+	if err := tx.Write(bg, func(context.Context) error { return fn(tx.XID()) }); err != nil {
 		if aerr := d.e.Abandon(); aerr != nil {
 			t.Fatal(aerr)
 		}
@@ -139,8 +139,8 @@ func TestCreateTableAndReload(t *testing.T) {
 		t.Fatal("new catalog is not empty")
 	}
 	var users *Table
-	if err := d.stmt(t, func() (err error) {
-		users, err = d.c.CreateTable(bg, usersDef(t))
+	if err := d.stmt(t, func(xid wal.XID) (err error) {
+		users, err = d.c.CreateTable(bg, xid, usersDef(t))
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -150,8 +150,8 @@ func TestCreateTableAndReload(t *testing.T) {
 	if got := describe(users); got != want {
 		t.Fatalf("created\n got  %s\n want %s", got, want)
 	}
-	if err := d.stmt(t, func() error {
-		_, err := d.c.CreateTable(bg, TableDef{Name: "t2", Columns: []ColumnDef{{Name: "x", Type: types.Bool}, {Name: "ts", Type: types.TimestampTZ}, {Name: "f", Type: types.Float8}}})
+	if err := d.stmt(t, func(xid wal.XID) error {
+		_, err := d.c.CreateTable(bg, xid, TableDef{Name: "t2", Columns: []ColumnDef{{Name: "x", Type: types.Bool}, {Name: "ts", Type: types.TimestampTZ}, {Name: "f", Type: types.Float8}}})
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -186,15 +186,16 @@ func TestCreateTableAndReload(t *testing.T) {
 func TestDDLIsAtomicAcrossCrash(t *testing.T) {
 	m := newFS(t)
 	d := open(t, m)
-	if err := d.stmt(t, func() error {
-		_, err := d.c.CreateTable(bg, TableDef{Name: "kept", Columns: []ColumnDef{{Name: "a", Type: types.Int4}}})
+	if err := d.stmt(t, func(xid wal.XID) error {
+		_, err := d.c.CreateTable(bg, xid, TableDef{Name: "kept", Columns: []ColumnDef{{Name: "a", Type: types.Int4}}})
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
 	// A CREATE TABLE whose transaction never commits.
-	if err := d.e.Begin().Write(bg, func(context.Context) error {
-		_, err := d.c.CreateTable(bg, usersDef(t))
+	tx := d.e.Begin()
+	if err := tx.Write(bg, func(context.Context) error {
+		_, err := d.c.CreateTable(bg, tx.XID(), usersDef(t))
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -219,8 +220,8 @@ func TestNameRules(t *testing.T) {
 	m := newFS(t)
 	d := open(t, m)
 	defer func() { d.close(t) }()
-	if err := d.stmt(t, func() error {
-		_, err := d.c.CreateTable(bg, usersDef(t))
+	if err := d.stmt(t, func(xid wal.XID) error {
+		_, err := d.c.CreateTable(bg, xid, usersDef(t))
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -259,7 +260,7 @@ func TestNameRules(t *testing.T) {
 	for _, c := range cases {
 		// These fail before changing anything: no statement is needed, and
 		// the error is a *sqlerr.Error, which promises it.
-		_, err := d.c.CreateTable(bg, c.def)
+		_, err := d.c.CreateTable(bg, 0, c.def) // fails before writing
 		var se *sqlerr.Error
 		if sqlerr.Code(err) != c.code || !errors.As(err, &se) {
 			t.Errorf("CreateTable(%.20s): %v, want %s", c.def.Name, err, c.code)
@@ -277,7 +278,7 @@ func TestNameRules(t *testing.T) {
 		{strings.Repeat("i", 64), []string{"age"}, sqlerr.NameTooLong},
 		{"novac_i", []string{"age"}, sqlerr.ReservedName},
 	} {
-		if _, err := d.c.CreateIndex(bg, users, c.name, c.cols, false); sqlerr.Code(err) != c.code {
+		if _, err := d.c.CreateIndex(bg, 0, users, c.name, c.cols, false); sqlerr.Code(err) != c.code { // fails before writing
 			t.Errorf("CreateIndex(%.20s, %v): %v, want %s", c.name, c.cols, err, c.code)
 		}
 	}
@@ -324,10 +325,10 @@ func TestIndexNames(t *testing.T) {
 	defer d.close(t)
 	long := strings.Repeat("x", 60)
 	var tbl, ltbl *Table
-	if err := d.stmt(t, func() (err error) {
-		tbl, err = d.c.CreateTable(bg, TableDef{Name: "t", Columns: []ColumnDef{{Name: "a", Type: types.Int4}, {Name: "b", Type: types.Int4}}})
+	if err := d.stmt(t, func(xid wal.XID) (err error) {
+		tbl, err = d.c.CreateTable(bg, xid, TableDef{Name: "t", Columns: []ColumnDef{{Name: "a", Type: types.Int4}, {Name: "b", Type: types.Int4}}})
 		if err == nil {
-			ltbl, err = d.c.CreateTable(bg, TableDef{Name: long, Columns: []ColumnDef{{Name: "é" + long[:55], Type: types.Int4}}, PrimaryKey: []string{"é" + long[:55]}})
+			ltbl, err = d.c.CreateTable(bg, xid, TableDef{Name: long, Columns: []ColumnDef{{Name: "é" + long[:55], Type: types.Int4}}, PrimaryKey: []string{"é" + long[:55]}})
 		}
 		return err
 	}); err != nil {
@@ -335,8 +336,8 @@ func TestIndexNames(t *testing.T) {
 	}
 	var names []string
 	for range 3 {
-		if err := d.stmt(t, func() error {
-			ix, err := d.c.CreateIndex(bg, tbl, "", []string{"a", "b"}, false)
+		if err := d.stmt(t, func(xid wal.XID) error {
+			ix, err := d.c.CreateIndex(bg, xid, tbl, "", []string{"a", "b"}, false)
 			if err == nil {
 				names = append(names, ix.Name)
 			}
@@ -352,8 +353,8 @@ func TestIndexNames(t *testing.T) {
 	if len(pk) > 63 || !strings.HasSuffix(pk, "_pkey") || !strings.HasPrefix(pk, "xxx") {
 		t.Fatalf("long primary key name %q", pk)
 	}
-	if err := d.stmt(t, func() error {
-		ix, err := d.c.CreateIndex(bg, ltbl, "", []string{"é" + long[:55]}, false)
+	if err := d.stmt(t, func(xid wal.XID) error {
+		ix, err := d.c.CreateIndex(bg, xid, ltbl, "", []string{"é" + long[:55]}, false)
 		if err == nil && (len(ix.Name) > 63 || !strings.HasSuffix(ix.Name, "_idx")) {
 			t.Errorf("long index name %q", ix.Name)
 		}
@@ -370,7 +371,9 @@ func insertRow(t *testing.T, tbl *Table, vals ...types.Value) storage.RID {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rid, err := tbl.Heap.Insert(bg, data)
+	rid, err := tbl.Heap.Insert(bg, data, func(storage.RID, *storage.Version) (storage.RowHeader, error) {
+		return storage.RowHeader{XID: 1}, nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,8 +386,8 @@ func TestCreateIndexOverExistingRows(t *testing.T) {
 	defer d.close(t)
 	var tbl *Table
 	rids := map[storage.RID]int32{}
-	if err := d.stmt(t, func() (err error) {
-		tbl, err = d.c.CreateTable(bg, TableDef{Name: "t", Columns: []ColumnDef{{Name: "a", Type: types.Int4}, {Name: "b", Type: types.Text}}})
+	if err := d.stmt(t, func(xid wal.XID) (err error) {
+		tbl, err = d.c.CreateTable(bg, xid, TableDef{Name: "t", Columns: []ColumnDef{{Name: "a", Type: types.Int4}, {Name: "b", Type: types.Text}}})
 		if err != nil {
 			return err
 		}
@@ -401,7 +404,7 @@ func TestCreateIndexOverExistingRows(t *testing.T) {
 	}
 	// A unique index over duplicates fails and changes nothing.
 	pagesBefore := d.e.Pool().Stats()
-	_, err := d.c.CreateIndex(bg, tbl, "u", []string{"a"}, true)
+	_, err := d.c.CreateIndex(bg, 0, tbl, "u", []string{"a"}, true) // fails before writing
 	if sqlerr.Code(err) != sqlerr.UniqueViolation || !strings.Contains(sqlerr.From(err).Detail, "Key (a)=(") {
 		t.Fatalf("unique index over duplicates: %v", err)
 	}
@@ -410,8 +413,8 @@ func TestCreateIndexOverExistingRows(t *testing.T) {
 	}
 	// A plain index has an entry for every row, NULLs included.
 	var ix *Index
-	if err := d.stmt(t, func() (err error) {
-		ix, err = d.c.CreateIndex(bg, tbl, "", []string{"a"}, false)
+	if err := d.stmt(t, func(xid wal.XID) (err error) {
+		ix, err = d.c.CreateIndex(bg, xid, tbl, "", []string{"a"}, false)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -437,11 +440,11 @@ func TestCreateIndexOverExistingRows(t *testing.T) {
 		if _, ok := rids[rid]; !ok {
 			t.Fatalf("entry for unknown row %v", rid)
 		}
-		data, err := tbl.Heap.Get(bg, rid)
+		got, err := tbl.Heap.Get(bg, rid)
 		if err != nil {
 			t.Fatal(err)
 		}
-		row, _ := types.DecodeRow(data, tbl.Types())
+		row, _ := types.DecodeRow(got.Data, tbl.Types())
 		want, _ := ix.Key(row, rid)
 		if string(want) != string(k) {
 			t.Fatalf("entry key does not match its row")
@@ -454,15 +457,15 @@ func TestUniqueIndexAllowsManyNulls(t *testing.T) {
 	m := newFS(t)
 	d := open(t, m)
 	defer d.close(t)
-	if err := d.stmt(t, func() error {
-		tbl, err := d.c.CreateTable(bg, TableDef{Name: "t", Columns: []ColumnDef{{Name: "a", Type: types.Int4}}})
+	if err := d.stmt(t, func(xid wal.XID) error {
+		tbl, err := d.c.CreateTable(bg, xid, TableDef{Name: "t", Columns: []ColumnDef{{Name: "a", Type: types.Int4}}})
 		if err != nil {
 			return err
 		}
 		insertRow(t, tbl, types.Null(types.Int4))
 		insertRow(t, tbl, types.Null(types.Int4))
 		insertRow(t, tbl, types.NewInt4(1))
-		_, err = d.c.CreateIndex(bg, tbl, "u", []string{"a"}, true)
+		_, err = d.c.CreateIndex(bg, xid, tbl, "u", []string{"a"}, true)
 		return err
 	}); err != nil {
 		t.Fatalf("unique index over several NULLs: %v", err)
@@ -492,28 +495,28 @@ func TestDropTableAndIndex(t *testing.T) {
 	m := newFS(t)
 	d := open(t, m)
 	var users *Table
-	if err := d.stmt(t, func() (err error) {
-		users, err = d.c.CreateTable(bg, usersDef(t))
+	if err := d.stmt(t, func(xid wal.XID) (err error) {
+		users, err = d.c.CreateTable(bg, xid, usersDef(t))
 		if err != nil {
 			return err
 		}
 		for i := range 300 {
 			insertRow(t, users, types.NewInt8(int64(i)), types.NewText(strings.Repeat("n", 100)), types.Null(types.Text), types.NewInt4(int32(i)))
 		}
-		_, err = d.c.CreateIndex(bg, users, "users_age", []string{"age"}, false)
+		_, err = d.c.CreateIndex(bg, xid, users, "users_age", []string{"age"}, false)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
 	pk := users.PrimaryKey()
-	if _, err := d.c.DropIndex(bg, pk); sqlerr.Code(err) != sqlerr.DependentObjectsStillExist {
+	if _, err := d.c.DropIndex(bg, 0, pk); sqlerr.Code(err) != sqlerr.DependentObjectsStillExist { // fails before writing
 		t.Fatalf("dropping the primary key's index: %v", err)
 	}
 	age, _ := d.c.Index("users_age")
 	agePages, _ := age.Tree.Pages(bg)
 	var dropped []uint64
-	if err := d.stmt(t, func() (err error) {
-		dropped, err = d.c.DropIndex(bg, age)
+	if err := d.stmt(t, func(xid wal.XID) (err error) {
+		dropped, err = d.c.DropIndex(bg, xid, age)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -522,8 +525,8 @@ func TestDropTableAndIndex(t *testing.T) {
 		t.Fatalf("DropIndex returned %d pages (tree has %d), indexes %d", len(dropped), len(agePages), len(users.Indexes))
 	}
 	heapPages := users.Heap.Pages()
-	if err := d.stmt(t, func() (err error) {
-		dropped, err = d.c.DropTable(bg, users)
+	if err := d.stmt(t, func(xid wal.XID) (err error) {
+		dropped, err = d.c.DropTable(bg, xid, users)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -545,8 +548,8 @@ func TestDropTableAndIndex(t *testing.T) {
 		t.Fatal("dropped objects came back after reopen")
 	}
 	// The name is free again.
-	if err := d.stmt(t, func() error {
-		_, err := d.c.CreateTable(bg, usersDef(t))
+	if err := d.stmt(t, func(xid wal.XID) error {
+		_, err := d.c.CreateTable(bg, xid, usersDef(t))
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -567,8 +570,8 @@ func TestBootstrapInterrupted(t *testing.T) {
 	m.Crash(vfs.CrashOptions{})
 	d := open(t, m)
 	defer d.close(t)
-	if err := d.stmt(t, func() error {
-		_, err := d.c.CreateTable(bg, TableDef{Name: "t", Columns: []ColumnDef{{Name: "a", Type: types.Int4}}})
+	if err := d.stmt(t, func(xid wal.XID) error {
+		_, err := d.c.CreateTable(bg, xid, TableDef{Name: "t", Columns: []ColumnDef{{Name: "a", Type: types.Int4}}})
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -660,15 +663,15 @@ func TestDamagedCatalogRows(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			m := newFS(t)
 			d := open(t, m)
-			if err := d.stmt(t, func() error {
-				tbl, err := d.c.CreateTable(bg, TableDef{Name: "t", Columns: []ColumnDef{{Name: "a", Type: types.Int4}}, PrimaryKey: []string{"a"}})
+			if err := d.stmt(t, func(xid wal.XID) error {
+				tbl, err := d.c.CreateTable(bg, xid, TableDef{Name: "t", Columns: []ColumnDef{{Name: "a", Type: types.Int4}}, PrimaryKey: []string{"a"}})
 				if err != nil {
 					return err
 				}
 				if tbl.ID != 1 {
 					t.Fatalf("table ID %d", tbl.ID)
 				}
-				_, err = d.c.insertSys(bg, c.which, c.row(tbl.PrimaryKey().Tree.Root()))
+				_, err = d.c.insertSys(bg, d.c.writer(xid), c.which, c.row(tbl.PrimaryKey().Tree.Root()))
 				return err
 			}); err != nil {
 				t.Fatal(err)
@@ -714,14 +717,14 @@ func TestDDLUnderIOFailures(t *testing.T) {
 			m := newFS(t)
 			d := open(t, m)
 			var base *Table
-			if err := d.stmt(t, func() (err error) {
-				if base, err = d.c.CreateTable(bg, TableDef{Name: "base", Columns: []ColumnDef{{Name: "a", Type: types.Int4}, {Name: "b", Type: types.Text}}}); err != nil {
+			if err := d.stmt(t, func(xid wal.XID) (err error) {
+				if base, err = d.c.CreateTable(bg, xid, TableDef{Name: "base", Columns: []ColumnDef{{Name: "a", Type: types.Int4}, {Name: "b", Type: types.Text}}}); err != nil {
 					return err
 				}
 				for i := range 300 {
 					insertRow(t, base, types.NewInt4(int32(i)), types.NewText(strings.Repeat("b", i%50)))
 				}
-				_, err = d.c.CreateTable(bg, TableDef{Name: "gone", Columns: []ColumnDef{{Name: "x", Type: types.Int8}}, PrimaryKey: []string{"x"}})
+				_, err = d.c.CreateTable(bg, xid, TableDef{Name: "gone", Columns: []ColumnDef{{Name: "x", Type: types.Int8}}, PrimaryKey: []string{"x"}})
 				return err
 			}); err != nil {
 				t.Fatal(err)
@@ -735,14 +738,15 @@ func TestDDLUnderIOFailures(t *testing.T) {
 			atCommit := false
 			tx := d.e.Begin()
 			err := tx.Write(bg, func(context.Context) error {
-				if _, err := d.c.CreateTable(bg, usersDef(t)); err != nil {
+				xid := tx.XID()
+				if _, err := d.c.CreateTable(bg, xid, usersDef(t)); err != nil {
 					return err
 				}
-				if _, err := d.c.CreateIndex(bg, base, "", []string{"b", "a"}, true); err != nil {
+				if _, err := d.c.CreateIndex(bg, xid, base, "", []string{"b", "a"}, true); err != nil {
 					return err
 				}
 				gone, _ := d.c.Table("gone")
-				_, err := d.c.DropTable(bg, gone)
+				_, err := d.c.DropTable(bg, xid, gone)
 				return err
 			})
 			if err == nil {
@@ -820,14 +824,14 @@ func TestIDsStayUniqueAcrossReloads(t *testing.T) {
 			maxID = max(maxID, id)
 		}
 		var tbl *Table
-		if err := d.stmt(t, func() (err error) {
+		if err := d.stmt(t, func(xid wal.XID) (err error) {
 			// Alternate which kind of object gets the highest ID.
 			name := "t" + strconv.Itoa(round)
-			if tbl, err = d.c.CreateTable(bg, TableDef{Name: name, Columns: []ColumnDef{{Name: "a", Type: types.Int4}}}); err != nil {
+			if tbl, err = d.c.CreateTable(bg, xid, TableDef{Name: name, Columns: []ColumnDef{{Name: "a", Type: types.Int4}}}); err != nil {
 				return err
 			}
 			if round%2 == 1 {
-				_, err = d.c.CreateIndex(bg, tbl, "", []string{"a"}, false)
+				_, err = d.c.CreateIndex(bg, xid, tbl, "", []string{"a"}, false)
 			}
 			return err
 		}); err != nil {
@@ -872,22 +876,22 @@ func TestLoadDoesNotDependOnRowOrder(t *testing.T) {
 	m := newFS(t)
 	d := open(t, m)
 	var users *Table
-	if err := d.stmt(t, func() (err error) {
-		users, err = d.c.CreateTable(bg, usersDef(t))
+	if err := d.stmt(t, func(xid wal.XID) (err error) {
+		users, err = d.c.CreateTable(bg, xid, usersDef(t))
 		if err == nil {
-			_, err = d.c.CreateIndex(bg, users, "", []string{"age"}, false)
+			_, err = d.c.CreateIndex(bg, xid, users, "", []string{"age"}, false)
 		}
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
 	want := describe(users)
-	if err := d.stmt(t, func() error {
+	if err := d.stmt(t, func(xid wal.XID) error {
 		for _, which := range []int{sysColumns, sysIndexes} {
 			var rows [][]types.Value
 			if err := d.c.scanSys(bg, which, func(rid storage.RID, row []types.Value) error {
 				rows = append(rows, row)
-				return d.c.sys[which].Delete(bg, rid)
+				return d.c.writer(xid).Delete(bg, d.c.sys[which], rid)
 			}); err != nil {
 				return err
 			}
@@ -895,7 +899,7 @@ func TestLoadDoesNotDependOnRowOrder(t *testing.T) {
 				t.Fatalf("only %d rows", len(rows))
 			}
 			for i := len(rows) - 1; i >= 0; i-- {
-				if _, err := d.c.insertSys(bg, which, rows[i]); err != nil {
+				if _, err := d.c.insertSys(bg, d.c.writer(xid), which, rows[i]); err != nil {
 					return err
 				}
 			}
@@ -918,8 +922,8 @@ func TestTablesAreSortedByName(t *testing.T) {
 	d := open(t, m)
 	defer d.close(t)
 	for _, name := range []string{"b", "c", "a", "ab"} {
-		if err := d.stmt(t, func() error {
-			_, err := d.c.CreateTable(bg, TableDef{Name: name, Columns: []ColumnDef{{Name: "x", Type: types.Int4}}})
+		if err := d.stmt(t, func(xid wal.XID) error {
+			_, err := d.c.CreateTable(bg, xid, TableDef{Name: name, Columns: []ColumnDef{{Name: "x", Type: types.Int4}}})
 			return err
 		}); err != nil {
 			t.Fatal(err)
@@ -941,8 +945,8 @@ func TestChosenNamesFitExactly(t *testing.T) {
 	pkName := func(table string) string {
 		t.Helper()
 		var tbl *Table
-		if err := d.stmt(t, func() (err error) {
-			tbl, err = d.c.CreateTable(bg, TableDef{Name: table, Columns: []ColumnDef{{Name: "a", Type: types.Int4}}, PrimaryKey: []string{"a"}})
+		if err := d.stmt(t, func(xid wal.XID) (err error) {
+			tbl, err = d.c.CreateTable(bg, xid, TableDef{Name: table, Columns: []ColumnDef{{Name: "a", Type: types.Int4}}, PrimaryKey: []string{"a"}})
 			return err
 		}); err != nil {
 			t.Fatal(err)

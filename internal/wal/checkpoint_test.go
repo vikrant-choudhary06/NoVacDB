@@ -34,7 +34,7 @@ func TestControlRoundTripAndLayout(t *testing.T) {
 	enc := AppendControl(nil, Control{CheckpointLSN: 0x0102, RedoLSN: 0x0304})
 	want := make([]byte, ControlSize)
 	copy(want[4:], "NOVACTL\x00")
-	binary.LittleEndian.PutUint32(want[12:], 3) // format version 3 (Step 6.2)
+	binary.LittleEndian.PutUint32(want[12:], 4) // format version 4 (Step 6.3)
 	binary.LittleEndian.PutUint64(want[16:], 0x0102)
 	binary.LittleEndian.PutUint64(want[24:], 0x0304)
 	binary.LittleEndian.PutUint32(want, crc32c(want[4:]))
@@ -67,7 +67,8 @@ func TestDecodeControlRejects(t *testing.T) {
 		{"long", append(AppendControl(nil, Control{}), 0), ErrCorrupt},
 		{"zeros", make([]byte, ControlSize), ErrCorrupt},
 		{"magic", reseal(func(b []byte) { b[4] = 'X' }), ErrCorrupt},
-		{"future version", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 4) }), ErrUnsupportedVersion},
+		{"future version", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 5) }), ErrUnsupportedVersion},
+		{"version 3", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 3) }), ErrUnsupportedVersion},
 		{"version 2", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 2) }), ErrUnsupportedVersion},
 		{"version 1", reseal(func(b []byte) { binary.LittleEndian.PutUint32(b[12:], 1) }), ErrUnsupportedVersion},
 		{"redo after checkpoint", reseal(func(b []byte) { binary.LittleEndian.PutUint64(b[24:], 501) }), ErrCorrupt},
@@ -330,21 +331,20 @@ func heapWork(t testing.TB, h *storage.Heap, rng *rand.Rand, rids *[]storage.RID
 	for range n {
 		switch op := rng.IntN(10); {
 		case op < 5 || len(*rids) == 0:
-			rid, err := h.Insert(bg, payload(rng, 1+rng.IntN(2500)))
+			rid, err := heapInsert(h, payload(rng, 1+rng.IntN(2500)))
 			if err != nil {
 				t.Fatalf("insert: %v", err)
 			}
 			*rids = append(*rids, rid)
 		case op < 8:
 			j := rng.IntN(len(*rids))
-			nr, err := h.Update(bg, (*rids)[j], payload(rng, 1+rng.IntN(5000)))
+			err := heapUpdate(h, (*rids)[j], payload(rng, 1+rng.IntN(5000)))
 			if err != nil {
 				t.Fatalf("update: %v", err)
 			}
-			(*rids)[j] = nr
 		default:
 			j := rng.IntN(len(*rids))
-			if err := h.Delete(bg, (*rids)[j]); err != nil {
+			if err := heapDelete(h, (*rids)[j]); err != nil {
 				t.Fatalf("delete: %v", err)
 			}
 			*rids = append((*rids)[:j], (*rids)[j+1:]...)
@@ -387,7 +387,7 @@ func TestRecoveryAfterCheckpointReplaysOnlyWhatIsNeeded(t *testing.T) {
 			rng := rand.New(rand.NewPCG(seed, 31))
 			m := newFS(t)
 			segSize := []int64{4096, 16384, 1 << 20}[rng.IntN(3)]
-			frames := 2 + rng.IntN(10)
+			frames := 3 + rng.IntN(10)
 			db := openTestDB(t, m, frames, segSize)
 			cl := &countingLogger{Logger: db.lg}
 			h, err := storage.CreateHeap(bg, db.bp, storage.WithLogger(cl))
@@ -429,7 +429,7 @@ func TestRecoveryAfterCheckpointReplaysOnlyWhatIsNeeded(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, rid := range rids {
-				if _, err := h2.Get(bg, rid); err != nil {
+				if _, err := heapGet(h2, rid); err != nil {
 					t.Fatalf("row %s after recovery: %v", rid, err)
 				}
 			}
@@ -604,7 +604,7 @@ func TestCheckpointMakesNextChangeLogAnImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rid, err := h.Insert(bg, []byte("before"))
+	rid, err := heapInsert(h, []byte("before"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,7 +633,7 @@ func TestCheckpointMakesNextChangeLogAnImage(t *testing.T) {
 		}
 		return b[0]
 	}
-	if _, err := h.Update(bg, rid, []byte("BEFORE")); err != nil {
+	if err := heapUpdate(h, rid, []byte("BEFORE")); err != nil {
 		t.Fatal(err)
 	}
 	if k := lastBlock().Kind; k != storage.BlockUpdate {
@@ -642,7 +642,7 @@ func TestCheckpointMakesNextChangeLogAnImage(t *testing.T) {
 	if _, err := db.ck.Checkpoint(bg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.Update(bg, rid, []byte("after")); err != nil {
+	if err := heapUpdate(h, rid, []byte("after")); err != nil {
 		t.Fatal(err)
 	}
 	if k := lastBlock().Kind; k != storage.BlockImage {
@@ -690,7 +690,7 @@ func TestCheckpointsDuringConcurrentWorkThenCrash(t *testing.T) {
 					var rids []storage.RID
 					for range 120 {
 						if len(rids) == 0 || rng.IntN(3) > 0 {
-							rid, err := h.Insert(bg, payload(rng, 1+rng.IntN(1500)))
+							rid, err := heapInsert(h, payload(rng, 1+rng.IntN(1500)))
 							if err != nil {
 								t.Errorf("insert: %v", err)
 								return
@@ -698,12 +698,11 @@ func TestCheckpointsDuringConcurrentWorkThenCrash(t *testing.T) {
 							rids = append(rids, rid)
 						} else {
 							j := rng.IntN(len(rids))
-							nr, err := h.Update(bg, rids[j], payload(rng, 1+rng.IntN(3000)))
+							err := heapUpdate(h, rids[j], payload(rng, 1+rng.IntN(3000)))
 							if err != nil {
 								t.Errorf("update: %v", err)
 								return
 							}
-							rids[j] = nr
 						}
 					}
 				}()

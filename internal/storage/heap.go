@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -157,6 +156,11 @@ func OpenHeap(ctx context.Context, bp *BufferPool, first uint64, opts ...HeapOpt
 			if err := sp.Validate(); err != nil {
 				return false, err
 			}
+			for slot := sp.NextLive(0); slot >= 0; slot = sp.NextLive(slot + 1) {
+				if _, err := tupleAt(sp, RID{Page: id, Slot: uint16(slot)}); err != nil {
+					return false, err
+				}
+			}
 			next, free = sp.NextPage(), sp.FreeSpace()
 			return false, nil
 		})
@@ -237,6 +241,11 @@ func (h *Heap) grow(ctx context.Context, size int) error {
 	if h.lg != nil {
 		return h.growLogged(ctx)
 	}
+	return h.growUnlogged(ctx)
+}
+
+// growUnlogged appends a page to an unlogged heap. The caller holds growMu.
+func (h *Heap) growUnlogged(ctx context.Context) error {
 	newID, err := newHeapPage(ctx, h.bp)
 	if err != nil {
 		return fmt.Errorf("growing heap: %w", err)
@@ -259,182 +268,4 @@ func (h *Heap) grow(ctx context.Context, size int) error {
 	h.pages = append(h.pages, heapPage{id: newID, free: MaxTupleSize})
 	h.mu.Unlock()
 	return nil
-}
-
-// Insert stores data as a new row and returns its RID.
-func (h *Heap) Insert(ctx context.Context, data []byte) (RID, error) {
-	if err := checkTupleSize(len(data)); err != nil {
-		return RID{}, err
-	}
-	for {
-		id, ok := h.pickPage(len(data))
-		if !ok {
-			if err := h.grow(ctx, len(data)); err != nil {
-				return RID{}, err
-			}
-			continue
-		}
-		var slot int
-		err := withPage(ctx, h.bp, id, true, h.lg != nil, func(sp *SlottedPage) (bool, error) {
-			before := h.snapshot(sp)
-			s, err := sp.Insert(data)
-			h.setFree(id, sp.FreeSpace()) // refresh the hint whatever happened
-			if err != nil {
-				return false, err
-			}
-			if err := h.logChanges(ctx, change{sp: sp, id: id, before: before,
-				op: HeapBlock{Page: id, Kind: BlockInsert, Slot: uint16(s), Data: data}}); err != nil {
-				h.setFree(id, sp.FreeSpace())
-				return false, err
-			}
-			slot = s
-			return true, nil
-		})
-		switch {
-		case err == nil:
-			return RID{Page: id, Slot: uint16(slot)}, nil
-		case errors.Is(err, ErrNoSpace):
-			continue // the hint was stale; it is fixed now
-		default:
-			return RID{}, fmt.Errorf("inserting row: %w", err)
-		}
-	}
-}
-
-// Get returns a copy of the row at rid.
-func (h *Heap) Get(ctx context.Context, rid RID) ([]byte, error) {
-	if err := h.checkRID(rid); err != nil {
-		return nil, err
-	}
-	var out []byte
-	err := withPage(ctx, h.bp, rid.Page, false, false, func(sp *SlottedPage) (bool, error) {
-		d, err := sp.Get(int(rid.Slot))
-		if err != nil {
-			return false, err
-		}
-		out = bytes.Clone(d)
-		return false, nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("getting row %s: %w", rid, err)
-	}
-	return out, nil
-}
-
-// Delete removes the row at rid.
-func (h *Heap) Delete(ctx context.Context, rid RID) error {
-	if err := h.checkRID(rid); err != nil {
-		return err
-	}
-	err := withPage(ctx, h.bp, rid.Page, true, h.lg != nil, func(sp *SlottedPage) (bool, error) {
-		before := h.snapshot(sp)
-		if err := sp.Delete(int(rid.Slot)); err != nil {
-			return false, err
-		}
-		if err := h.logChanges(ctx, change{sp: sp, id: rid.Page, before: before,
-			op: HeapBlock{Page: rid.Page, Kind: BlockDelete, Slot: rid.Slot}}); err != nil {
-			return false, err
-		}
-		h.setFree(rid.Page, sp.FreeSpace())
-		return true, nil
-	})
-	if err != nil {
-		return fmt.Errorf("deleting row %s: %w", rid, err)
-	}
-	return nil
-}
-
-// Update replaces the row at rid and returns its RID afterwards. If the new
-// version fits on the row's page the RID is unchanged. Otherwise the row
-// moves to another page and the new RID is returned; callers that remember
-// RIDs (indexes) must switch to it.
-func (h *Heap) Update(ctx context.Context, rid RID, data []byte) (RID, error) {
-	if err := checkTupleSize(len(data)); err != nil {
-		return RID{}, err
-	}
-	if err := h.checkRID(rid); err != nil {
-		return RID{}, err
-	}
-	err := withPage(ctx, h.bp, rid.Page, true, h.lg != nil, func(sp *SlottedPage) (bool, error) {
-		before := h.snapshot(sp)
-		err := sp.Update(int(rid.Slot), data)
-		if err == nil || errors.Is(err, ErrNoSpace) {
-			h.setFree(rid.Page, sp.FreeSpace())
-		}
-		if err != nil {
-			return false, err
-		}
-		if err := h.logChanges(ctx, change{sp: sp, id: rid.Page, before: before,
-			op: HeapBlock{Page: rid.Page, Kind: BlockUpdate, Slot: rid.Slot, Data: data}}); err != nil {
-			h.setFree(rid.Page, sp.FreeSpace())
-			return false, err
-		}
-		return true, nil
-	})
-	if err == nil {
-		return rid, nil
-	}
-	if !errors.Is(err, ErrNoSpace) {
-		return RID{}, fmt.Errorf("updating row %s: %w", rid, err)
-	}
-	if h.lg != nil {
-		return h.moveLogged(ctx, rid, data)
-	}
-
-	// Does not fit on its page: insert the new version first, then retire the
-	// old one, so a failure never loses the row.
-	newRID, err := h.Insert(ctx, data)
-	if err != nil {
-		return RID{}, fmt.Errorf("updating row %s: moving it: %w", rid, err)
-	}
-	if err := h.Delete(ctx, rid); err != nil {
-		// Undo the insert so the row is not duplicated.
-		if uerr := h.Delete(context.WithoutCancel(ctx), newRID); uerr != nil {
-			err = errors.Join(err, uerr)
-		}
-		return RID{}, fmt.Errorf("updating row %s: removing old version: %w", rid, err)
-	}
-	return newRID, nil
-}
-
-// Scanner iterates over all rows of a heap in page-chain order. It holds no
-// pin or latch between calls. It sees each page as of the moment it visits
-// it; there is no snapshot isolation (that is Phase 6).
-type Scanner struct {
-	h    *Heap
-	page uint64 // current page, 0 when finished
-	slot int    // next slot to look at on that page
-}
-
-// Scan starts a scan at the first page.
-func (h *Heap) Scan() *Scanner { return &Scanner{h: h, page: h.first} }
-
-// Next returns the next row (a copy of its bytes). ok is false at the end.
-func (s *Scanner) Next(ctx context.Context) (rid RID, data []byte, ok bool, err error) {
-	for s.page != 0 {
-		var found bool
-		var next uint64
-		err = withPage(ctx, s.h.bp, s.page, false, false, func(sp *SlottedPage) (bool, error) {
-			slot := sp.NextLive(s.slot)
-			if slot < 0 {
-				next = sp.NextPage()
-				return false, nil
-			}
-			d, gerr := sp.Get(slot)
-			if gerr != nil {
-				return false, gerr
-			}
-			rid, data, found = RID{Page: s.page, Slot: uint16(slot)}, bytes.Clone(d), true
-			s.slot = slot + 1
-			return false, nil
-		})
-		if err != nil {
-			return RID{}, nil, false, fmt.Errorf("scanning page %d: %w", s.page, err)
-		}
-		if found {
-			return rid, data, true, nil
-		}
-		s.page, s.slot = next, 0
-	}
-	return RID{}, nil, false, nil
 }

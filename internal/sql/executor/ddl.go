@@ -8,6 +8,7 @@ import (
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/ast"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/sqlerr"
 	"github.com/vikrant-choudhary06/NoVacDB/internal/sql/types"
+	"github.com/vikrant-choudhary06/NoVacDB/internal/wal"
 )
 
 func (st *stmt) createTable(s *ast.CreateTable) (*Result, error) {
@@ -66,8 +67,8 @@ func (st *stmt) createTable(s *ast.CreateTable) (*Result, error) {
 			def.Unique = append(def.Unique, cols)
 		}
 	}
-	err := st.apply(true, func(ctx context.Context) error {
-		_, err := st.db.cat.CreateTable(ctx, def)
+	err := st.apply(true, func(ctx context.Context, xid wal.XID) error {
+		_, err := st.db.cat.CreateTable(ctx, xid, def)
 		return err
 	})
 	if err != nil {
@@ -99,8 +100,8 @@ func (st *stmt) dropTable(s *ast.DropTable) (*Result, error) {
 	case !ok:
 		return nil, sqlerr.New(sqlerr.UndefinedTable, "table %q does not exist", s.Name.Name).At(st.sql, s.Name.P)
 	}
-	err := st.apply(true, func(ctx context.Context) error {
-		pages, err := st.db.cat.DropTable(ctx, tbl)
+	err := st.apply(true, func(ctx context.Context, xid wal.XID) error {
+		pages, err := st.db.cat.DropTable(ctx, xid, tbl)
 		if err != nil {
 			return err
 		}
@@ -146,8 +147,8 @@ func (st *stmt) createIndex(s *ast.CreateIndex) (*Result, error) {
 		}
 		cols[i] = c.Name
 	}
-	err = st.apply(true, func(ctx context.Context) error {
-		_, err := st.db.cat.CreateIndex(ctx, tbl, s.Name.Name, cols, s.Unique)
+	err = st.apply(true, func(ctx context.Context, xid wal.XID) error {
+		_, err := st.db.cat.CreateIndex(ctx, xid, tbl, s.Name.Name, cols, s.Unique)
 		return err
 	})
 	if err != nil {
@@ -173,8 +174,8 @@ func (st *stmt) dropIndex(s *ast.DropIndex) (*Result, error) {
 	case !ok:
 		return nil, sqlerr.New(sqlerr.UndefinedObject, "index %q does not exist", s.Name.Name).At(st.sql, s.Name.P)
 	}
-	err := st.apply(true, func(ctx context.Context) error {
-		pages, err := st.db.cat.DropIndex(ctx, ix)
+	err := st.apply(true, func(ctx context.Context, xid wal.XID) error {
+		pages, err := st.db.cat.DropIndex(ctx, xid, ix)
 		if err != nil {
 			return err
 		}

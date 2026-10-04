@@ -449,6 +449,7 @@ func TestOpenRejectsBadFiles(t *testing.T) {
 		{"wrong magic", [][]byte{resealWith(t, good0, func(p []byte) { p[0] = 'X' })}, ErrBadMagic},
 		{"future version", [][]byte{resealWith(t, good0, func(p []byte) { binary.LittleEndian.PutUint32(p[hdrOffVersion:], FormatVersion+1) })}, ErrUnsupportedVersion},
 		{"version 1, before leaf flags", [][]byte{resealWith(t, good0, func(p []byte) { binary.LittleEndian.PutUint32(p[hdrOffVersion:], 1) })}, ErrUnsupportedVersion},
+		{"version 3, before row headers", [][]byte{resealWith(t, good0, func(p []byte) { binary.LittleEndian.PutUint32(p[hdrOffVersion:], 3) })}, ErrUnsupportedVersion},
 		{"version 2, before undo pages", [][]byte{resealWith(t, good0, func(p []byte) { binary.LittleEndian.PutUint32(p[hdrOffVersion:], 2) })}, ErrUnsupportedVersion},
 		{"page size 4096", [][]byte{resealWith(t, good0, func(p []byte) { binary.LittleEndian.PutUint32(p[hdrOffPageSize:], 4096) })}, ErrPageSizeMismatch},
 		{"page count 1", [][]byte{resealWith(t, good0, func(p []byte) { binary.LittleEndian.PutUint64(p[hdrOffPageCount:], 1) })}, ErrCorrupt},

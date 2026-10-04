@@ -150,6 +150,14 @@ func nextStatement(rng *rand.Rand, m sqlModel, nextID *int) sqlStatement {
 		if m.extra >= 0 && rng.IntN(3) == 0 {
 			return sqlStatement{sql: "DROP TABLE extra", ddl: true, apply: func(m *sqlModel) { m.extra = -1 }}
 		}
+		if m.extra > 0 && rng.IntN(2) == 0 {
+			// Rows grow and shrink, so some move away from their page and
+			// back (docs/design/15-row-versioning.md section 2.2); the
+			// count of rows must not change.
+			pad := strings.Repeat(string(rune('a'+rng.IntN(26))), 10+rng.IntN(3500))
+			mod, r := 2+rng.IntN(3), rng.IntN(2)
+			return sqlStatement{sql: fmt.Sprintf("UPDATE extra SET pad = '%s' WHERE x %% %d = %d", pad, mod, r), apply: func(*sqlModel) {}}
+		}
 		n := 1 + rng.IntN(30)
 		var vals []string
 		for range n {

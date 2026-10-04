@@ -255,6 +255,25 @@ func checkTupleSize(n int) error {
 	return nil
 }
 
+// insertSlot returns the slot Insert would give a tuple of n bytes, without
+// changing the page, or ErrNoSpace.
+func (p *SlottedPage) insertSlot(n int) (int, error) {
+	if err := checkTupleSize(n); err != nil {
+		return 0, err
+	}
+	st, err := p.stats()
+	if err != nil {
+		return 0, err
+	}
+	if n > insertCapacity(st) {
+		return 0, ErrNoSpace
+	}
+	if st.firstDead >= 0 {
+		return st.firstDead, nil
+	}
+	return p.numSlots(), nil
+}
+
 // Insert stores data in the lowest dead slot, or a new slot, and returns the
 // slot number. data must not alias the page. If the page has no room it
 // returns ErrNoSpace and is unchanged.

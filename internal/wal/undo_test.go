@@ -101,6 +101,15 @@ func checkUndo(t *testing.T, e *Engine, want map[XID]writtenUndo, what string) {
 	}
 }
 
+// mustUndoEngine opens an engine that keeps committed transactions' undo,
+// as Step 6.4 will: these tests are about the undo log itself.
+func mustUndoEngine(t *testing.T, fsys vfs.FS, opts EngineOptions) *Engine {
+	t.Helper()
+	e := mustEngine(t, fsys, opts)
+	e.keepUndo = true
+	return e
+}
+
 // Committed transactions' undo survives power cuts, torn writes and
 // checkpoints at random points; an uncommitted transaction leaves no
 // segment; released segments stay released.
@@ -119,7 +128,7 @@ func TestUndoSurvivesCrashes(t *testing.T) {
 			_ = m.MkdirAll("/db")
 			_ = m.SyncDir("/")
 			opts := EngineOptions{Frames: 8 + rng.IntN(24), WAL: Options{SegmentSize: []int64{8192, 1 << 20}[rng.IntN(2)]}}
-			e := mustEngine(t, m, opts)
+			e := mustUndoEngine(t, m, opts)
 			want := map[XID]writtenUndo{}
 			for cycle := range 3 {
 				for range 1 + rng.IntN(8) {
@@ -168,7 +177,7 @@ func TestUndoSurvivesCrashes(t *testing.T) {
 					torn++
 				}
 				m.Crash(opt)
-				e = mustEngine(t, m, opts)
+				e = mustUndoEngine(t, m, opts)
 				if e.Recovery().DiscardedTransactions > 0 {
 					discarded++
 				}
@@ -183,7 +192,7 @@ func TestUndoSurvivesCrashes(t *testing.T) {
 			if err := e.Close(bg); err != nil {
 				t.Fatal(err)
 			}
-			e = mustEngine(t, m, opts)
+			e = mustUndoEngine(t, m, opts)
 			checkUndo(t, e, want, "after a clean restart")
 			if err := e.Close(bg); err != nil {
 				t.Fatal(err)
@@ -201,7 +210,7 @@ func TestUndoSurvivesCrashes(t *testing.T) {
 func TestUndoSegmentTableSurvivesLogTrimming(t *testing.T) {
 	m := newFS(t)
 	opts := EngineOptions{Frames: 16, WAL: Options{SegmentSize: 8192}}
-	e := mustEngine(t, m, opts)
+	e := mustUndoEngine(t, m, opts)
 	rng := rand.New(rand.NewPCG(testSeed(t), 62))
 	want := map[XID]writtenUndo{}
 	for range 5 {
@@ -237,12 +246,12 @@ func TestUndoSegmentTableSurvivesLogTrimming(t *testing.T) {
 		}
 	}
 	m.Crash(vfs.CrashOptions{TearLast: true})
-	e = mustEngine(t, m, opts)
+	e = mustUndoEngine(t, m, opts)
 	checkUndo(t, e, want, "after trimming and a crash")
 	if err := e.Close(bg); err != nil {
 		t.Fatal(err)
 	}
-	e = mustEngine(t, m, opts)
+	e = mustUndoEngine(t, m, opts)
 	defer func() { _ = e.Close(bg) }()
 	checkUndo(t, e, want, "after a restart")
 }
@@ -254,7 +263,7 @@ func TestReleasedUndoPagesAreFreed(t *testing.T) {
 		t.Run(fmt.Sprintf("crash=%v", crash), func(t *testing.T) {
 			m := newFS(t)
 			opts := EngineOptions{Frames: 16}
-			e := mustEngine(t, m, opts)
+			e := mustUndoEngine(t, m, opts)
 			tx := e.Begin()
 			if err := tx.Write(bg, func(ctx context.Context) error {
 				for range 20 {
@@ -287,7 +296,7 @@ func TestReleasedUndoPagesAreFreed(t *testing.T) {
 			}
 			if crash {
 				m.Crash(vfs.CrashOptions{TearLast: true})
-				e = mustEngine(t, m, opts)
+				e = mustUndoEngine(t, m, opts)
 				if len(e.Undo().Segments()) != 0 {
 					t.Fatalf("segments after the crash: %v", e.Undo().Segments())
 				}

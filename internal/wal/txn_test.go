@@ -31,7 +31,7 @@ func countByStatement(t *testing.T, h *storage.Heap, tr *btree.Tree) (map[int]in
 	rows, keys := map[int]int{}, map[int]int{}
 	s := h.Scan()
 	for {
-		_, d, ok, err := s.Next(bg)
+		_, d, ok, err := heapNext(s)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -61,7 +61,7 @@ func countByStatement(t *testing.T, h *storage.Heap, tr *btree.Tree) (map[int]in
 func insertRows(h *storage.Heap, tr *btree.Tree, stmt, from, n int) error {
 	for i := from; i < from+n; i++ {
 		r := stmtRow(stmt, i)
-		if _, err := h.Insert(bg, r); err != nil {
+		if _, err := heapInsert(h, r); err != nil {
 			return err
 		}
 		if err := tr.Insert(bg, r[:8+rand.IntN(200)], nil); err != nil {
@@ -136,7 +136,7 @@ func TestCommittedTxnSurvivesAndUncommittedIsDiscarded(t *testing.T) {
 	for part := range 3 {
 		if err := tx.Write(bg, func(context.Context) error {
 			for i := part * 10; i < part*10+10; i++ {
-				if _, err := h.Insert(bg, stmtRow(2, i)); err != nil {
+				if _, err := heapInsert(h, stmtRow(2, i)); err != nil {
 					return err
 				}
 				if err := tr.Insert(bg, stmtRow(2, i), nil); err != nil {
@@ -209,7 +209,7 @@ func TestTxnPagesNeverReachDiskBeforeCommit(t *testing.T) {
 			return err
 		}
 		for i := range 150 {
-			if _, err := other.Insert(bg, stmtRow(100, i)); err != nil {
+			if _, err := heapInsert(other, stmtRow(100, i)); err != nil {
 				return err
 			}
 		}
@@ -226,7 +226,7 @@ func TestTxnPagesNeverReachDiskBeforeCommit(t *testing.T) {
 	for ; err == nil && n < 1000; n++ {
 		err = tx.Write(bg, func(context.Context) error {
 			r := stmtRow(9, n)
-			if _, err := h.Insert(bg, r); err != nil {
+			if _, err := heapInsert(h, r); err != nil {
 				return err
 			}
 			return tr.Insert(bg, r, nil)
@@ -268,7 +268,7 @@ func TestCheckpointWaitsForWritingTxn(t *testing.T) {
 	defer func() { _ = e.Close(bg) }()
 	h, tr := setupHeapAndTree(t, e)
 	tx := openTxn(t, e, func() error {
-		_, err := h.Insert(bg, stmtRow(1, 0))
+		_, err := heapInsert(h, stmtRow(1, 0))
 		return err
 	})
 	done := make(chan error, 1)
@@ -393,7 +393,7 @@ func TestAbandonedTxnStaysDiscarded(t *testing.T) {
 	}
 	tx := openTxn(t, e, func() error {
 		for i := range 5 {
-			if _, err := h.Insert(bg, stmtRow(2, i)); err != nil {
+			if _, err := heapInsert(h, stmtRow(2, i)); err != nil {
 				return err
 			}
 		}
