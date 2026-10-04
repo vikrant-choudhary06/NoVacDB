@@ -24,3 +24,4 @@ Failure & crash, Alternatives, Testing plan, Limitations.
 | [13](13-transactions.md) | Transactions (`internal/wal`, `internal/sql/executor`) | Step 6.1 implemented |
 | [14](14-undo-log.md) | Undo log (`internal/undo`, `internal/wal`) | Step 6.2 implemented |
 | [15](15-row-versioning.md) | Row versioning (`internal/storage`, `internal/mvcc`) | Step 6.3 implemented |
+| [16](16-snapshots-visibility.md) | Snapshots and visibility (`internal/wal`, `internal/mvcc`, `internal/sql/executor`) | Step 6.4 designed, awaiting review |

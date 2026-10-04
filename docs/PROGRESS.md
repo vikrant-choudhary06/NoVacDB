@@ -8,7 +8,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 
 ## Current step
 
-👉 **Step 6.4 — Snapshots and visibility** (design doc `16-snapshots-visibility.md` first)
+👉 **Step 6.4 — Snapshots and visibility** (design doc `16-snapshots-visibility.md` awaiting review)
 
 ---
 
