@@ -13,12 +13,13 @@ import (
 // 2.5): its statements commit or roll back together. It is not safe for
 // concurrent use.
 //
-// Until row versions and locks exist (section 2.6), a transaction that has
-// changed something holds the database's exclusive lock until it ends: no
-// other statement runs meanwhile, in any session, so nobody sees its
-// uncommitted changes. Calling the DB's own methods from the goroutine of
-// such a transaction would wait for the transaction itself; use the Tx's
-// methods.
+// A transaction that has changed something holds the writer slot until it
+// ends (docs/design/16-snapshots-visibility.md section 2.4): other
+// sessions read meanwhile, each through its own snapshot, so nobody sees
+// its uncommitted changes, but another change waits for it. One that ran
+// DDL also holds the exclusive lock, and nothing else runs. Calling the
+// DB's own methods to change data from the goroutine of such a
+// transaction would wait for the transaction itself; use the Tx's methods.
 type Tx struct {
 	db        *DB
 	isolation IsolationLevel
@@ -26,7 +27,10 @@ type Tx struct {
 	// statement (docs/design/16-snapshots-visibility.md section 2.3).
 	snap *wal.Snapshot
 	wtx  *wal.Txn // nil until the first change
-	// locked: the transaction holds db.mu exclusively.
+	// writing: the transaction holds the writer slot (db.writer), from
+	// its first change to its end.
+	writing bool
+	// locked: the transaction holds db.mu exclusively (it ran DDL).
 	locked bool
 	// failed: a statement failed; only Rollback (or Commit, which rolls
 	// back) is left.
@@ -154,7 +158,7 @@ func (tx *Tx) Commit(ctx context.Context) error {
 	lsn, err := tx.wtx.Commit(ctx)
 	if err != nil {
 		// Outcome unknown until recovery decides it.
-		return db.restart(ctx, err, true)
+		return db.restart(ctx, err, true, tx.held())
 	}
 	db.maybeCheckpoint(ctx, lsn)
 	return nil
@@ -171,11 +175,19 @@ func (tx *Tx) Rollback(ctx context.Context) error {
 	if tx.wtx == nil || tx.discarded {
 		return nil
 	}
-	return tx.db.discard(context.WithoutCancel(ctx), tx.wtx)
+	return tx.db.discard(context.WithoutCancel(ctx), tx.wtx, tx.held())
 }
 
-// end marks the transaction over and releases its snapshot and the lock it
-// holds.
+// held returns how the transaction holds db.mu between statements.
+func (tx *Tx) held() held {
+	if tx.locked {
+		return heldExclusiveByTx
+	}
+	return heldNone
+}
+
+// end marks the transaction over and releases its snapshot and the locks
+// it holds.
 func (tx *Tx) end() {
 	tx.done = true
 	if tx.snap != nil {
@@ -185,5 +197,9 @@ func (tx *Tx) end() {
 	if tx.locked {
 		tx.locked = false
 		tx.db.mu.Unlock()
+	}
+	if tx.writing {
+		tx.writing = false
+		tx.db.writer.Unlock()
 	}
 }

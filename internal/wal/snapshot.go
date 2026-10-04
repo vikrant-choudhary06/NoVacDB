@@ -83,16 +83,15 @@ func (e *Engine) LiveSnapshots() int {
 }
 
 // releaseUndo releases the undo segments that no live snapshot needs:
-// every committed transaction's (committing counts as committed) that each
-// snapshot sees (section 2.6). The caller holds the writer slot, or no
-// transaction can be writing, so the records it logs never fall inside
-// another transaction's.
-func (e *Engine) releaseUndo(ctx context.Context, committing XID) error {
+// every committed transaction's that each snapshot sees (section 2.6). The
+// caller holds the writer slot, or no transaction can be writing, so the
+// records it logs never fall inside another transaction's.
+func (e *Engine) releaseUndo(ctx context.Context) error {
 	if e.keepUndo {
 		return nil
 	}
 	for _, x := range e.undo.Segments() {
-		if !e.undoReleasable(XID(x), committing) {
+		if !e.undoReleasable(XID(x)) {
 			continue
 		}
 		if err := e.undo.Release(ctx, x); err != nil {
@@ -102,10 +101,10 @@ func (e *Engine) releaseUndo(ctx context.Context, committing XID) error {
 	return nil
 }
 
-func (e *Engine) undoReleasable(xid, committing XID) bool {
+func (e *Engine) undoReleasable(xid XID) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, active := e.active[xid]; active && xid != committing {
+	if _, active := e.active[xid]; active {
 		return false
 	}
 	for s := range e.snaps {

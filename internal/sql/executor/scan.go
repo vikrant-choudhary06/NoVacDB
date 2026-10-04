@@ -230,37 +230,78 @@ func (st *stmt) scan(tbl *catalog.Table, a access, where node, fn func(rid stora
 		}
 		return fn(rid, row)
 	}
-	if a.ix == nil {
-		s := tbl.Heap.ScanVersions()
-		for {
-			rid, v, ok, err := s.Next(st.ctx)
-			if err != nil || !ok {
-				return err
-			}
-			if more, err := visit(rid, v); err != nil || !more {
-				return err
+	if a.ix != nil {
+		// The index describes what the snapshot sees only if the snapshot
+		// sees the last writer and no new writer touches the index during
+		// the scan; every writer becomes the last writer before it changes
+		// an index (docs/design/16-snapshots-visibility.md section 2.8).
+		// The plan checked the first at plan time, but a writer may have
+		// begun since. So the hits are collected, and used only if the last
+		// writer, as of before the scan, is one the snapshot sees and is
+		// still the last writer after it; otherwise the table is read
+		// instead.
+		if h := st.db.indexScanHook; h != nil {
+			h()
+		}
+		before := st.db.e.LastWriter()
+		if st.indexesShow(before) {
+			hits, err := st.indexHits(tbl, a)
+			if st.db.e.LastWriter() == before {
+				if err != nil {
+					return err
+				}
+				st.db.indexScans.Add(1)
+				for _, h := range hits {
+					if more, err := visit(h.rid, h.v); err != nil || !more {
+						return err
+					}
+				}
+				return nil
 			}
 		}
+		st.db.indexScanRetries.Add(1)
 	}
-	st.db.indexScans.Add(1)
+	s := tbl.Heap.ScanVersions()
+	for {
+		rid, v, ok, err := s.Next(st.ctx)
+		if err != nil || !ok {
+			return err
+		}
+		if more, err := visit(rid, v); err != nil || !more {
+			return err
+		}
+	}
+}
+
+// indexHit is a row an index scan found, and its current version.
+type indexHit struct {
+	rid storage.RID
+	v   storage.Version
+}
+
+// indexHits reads the index range a describes and the current version of
+// each row it names.
+func (st *stmt) indexHits(tbl *catalog.Table, a access) ([]indexHit, error) {
+	var hits []indexHit
 	it := a.ix.Tree.Scan(a.start, a.end)
 	for {
 		_, v, ok, err := it.Next(st.ctx)
 		if err != nil || !ok {
-			return err
+			return hits, err
 		}
 		rid, err := catalog.DecodeRID(v)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		// Indexes are used only when they describe what the snapshot sees
-		// (access); the visibility rule still decides each row.
 		row, err := tbl.Heap.GetVersion(st.ctx, rid)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if more, err := visit(rid, row); err != nil || !more {
-			return err
+		hits = append(hits, indexHit{rid, row})
+		if len(hits)%256 == 0 {
+			if err := st.ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
 	}
 }

@@ -8,7 +8,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 
 ## Current step
 
-👉 **Step 6.4 — Snapshots and visibility** (design approved; 6.4a done, 6.4b — readers that do not wait for the writer — in progress)
+👉 **Step 6.5 — Rollback** (next: its design doc, for review before any code)
 
 ---
 
@@ -21,6 +21,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 | 2026-10-03 | 6.2 Undo log | ✅ Done | Design doc `14-undo-log.md` (reviewed and approved, including data format version 3 with undo pages, type 6, and WAL format version 3 with `Undo` and `UndoSegment` records, types 10 and 11). New package `internal/undo`: one segment of undo pages per transaction in the data file; 54-byte record header plus the full previous row image (at most 8090 bytes; Step 6.3 lowers the maximum row to 8000); undo pointers are page × 8192 + offset; `Append` sets the transaction chain itself; every page and record validated on read. Undo pages follow the existing WAL rules (images after a redo point, no steal, deferred frees on release). The segment table is logged on add and drop and logged again by every checkpoint; recovery rebuilds it and follows each segment's pages. Tests: golden bytes, every truncation, `FuzzUndoRecord` and `FuzzDecodeBlocks`, a model test of row chains across 60 transactions, replay byte-for-byte and from a redo point with torn pages, engine crash tests (40 runs with torn writes, in-flight transactions, releases), the table surviving log trimming, released pages freed after a crash. 33 deliberate-bug checks in about 1.5 minutes: 29 caught at first, the other 4 after 3 new test cases and the removal of a duplicate check. |
 | 2026-10-04 | 6.3 In-place updates with row versioning | ✅ Done | Design doc `15-row-versioning.md` (reviewed and approved, including data format version 4, a header on every heap row, and WAL format version 4, heap records of up to three blocks). Every row carries the transaction that last wrote it and an undo pointer; `UPDATE` saves the old version to the undo log and changes the row in place; a row that outgrows its page moves and leaves an 18-byte forward stub, so its RID never changes (one hop at most, moving home again when it fits); `DELETE` leaves an 18-byte tombstone; `INSERT` writes an undo record. New package `internal/mvcc` (undo first, then the row, through a `Stamper` callback). Maximum row 8000 bytes. Interim until Step 6.4: undo released at commit. Tests: golden bytes and `FuzzRowHeader`, a heap model test with forwarding invariants (it found that a 12-byte stub could not always become a tombstone), an mvcc model test checking every changed row's undo chain before commit with crashes, 10,000 updates of one row without table or file growth, row size limits, SQL crash workload with rows that move. 30 deliberate-bug checks: 27 caught (4 after new tests), 3 unreachable defensive checks kept. |
 | 2026-10-04 | 6.4a Snapshots and visibility (part 1) | ✅ Done | Design doc `16-snapshots-visibility.md` (reviewed and approved, no format change). Snapshots (`XMax`, active transactions) registered by the engine; the visibility rule, following undo chains with every record checked; `READ COMMITTED` and `REPEATABLE READ` (`DB.BeginTx`); a transaction sees its own changes; `REPEATABLE READ` changing a row changed after its snapshot gets `40001`; indexes used only when they describe what the snapshot sees; undo kept while a snapshot needs it, released by the next commit or checkpoint, and by recovery. Readers still wait for a writing transaction (6.4b). Tests: the visibility rule on every case, a model of snapshots held across random commits, undo retention, isolation tests through the executor. 22 deliberate-bug checks: all caught (4 after new tests). |
+| 2026-10-04 | 6.4b Snapshots and visibility (part 2): readers beside the writer | ✅ Done | Readers no longer wait for a writing transaction: every statement holds the executor lock shared, a change also takes the writer slot (until its transaction ends), DDL takes the writer slot and the lock exclusively; lock order writer slot, then lock; reopening (rollback, restart, `40001`) trades the shared lock for the exclusive one; `Close` waits for a writing transaction. Two real bugs found by the new tests and fixed: a transaction's ID was not yet active between its allocation and its `TxnBegin` record (a snapshot then saw its uncommitted changes); a committing transaction released its own undo before leaving the active set (a snapshot taken in between found the undo reused). Undo is now released just after the commit record. Index scans are checked as they run (the snapshot must see the last writer, and no new writer may begin during the scan), otherwise the table is read. Tests: a model checker under `-race` (one writer committing and rolling back, `REPEATABLE READ` readers checking every read by heap and by index against the state their snapshot must see, with checkpoints and a small pool), no dirty reads, writers waiting, DDL with concurrent writers, readers during rollbacks and restarts, `Close` waiting, a test hook for a writer beginning before an index scan; the SQL crash harness gained a concurrent reader checking committed states in commit order. 26 deliberate-bug checks: all caught (7 after new tests, 2 equivalent ones replaced). |
 
 ---
 
@@ -133,7 +134,7 @@ flowchart TB
 
 ---
 
-### 👉 Step 6.4 — Snapshots and visibility
+### ✅ Step 6.4 — Snapshots and visibility
 
 **Goal:** Every reader sees a consistent picture of the data.
 
@@ -148,7 +149,7 @@ flowchart TB
 
 ---
 
-### ⬜ Step 6.5 — Rollback
+### 👉 Step 6.5 — Rollback
 
 **Goal:** `ROLLBACK` and failed statements undo their changes exactly.
 

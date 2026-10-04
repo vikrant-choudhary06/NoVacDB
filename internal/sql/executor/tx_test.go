@@ -261,7 +261,10 @@ func TestTxOutgrowsThePool(t *testing.T) {
 	mustExec(t, db, "INSERT INTO t VALUES (1, 'after')")
 }
 
-func TestWritingTxBlocksOtherStatements(t *testing.T) {
+func TestWritingTxBlocksOnlyWriters(t *testing.T) {
+	// Readers never wait for a writing transaction and never see its
+	// uncommitted rows; another writer waits for it to end
+	// (docs/design/16-snapshots-visibility.md section 2.4).
 	db := newDB(t)
 	mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
 	// A transaction that only read blocks nobody.
@@ -269,39 +272,54 @@ func TestWritingTxBlocksOtherStatements(t *testing.T) {
 	txExec(t, ro, "SELECT * FROM t")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	tx := mustBegin(t, db)
+	committed := false
+	t.Cleanup(func() {
+		if !committed {
+			_ = tx.Rollback(bg) // so that Close does not wait for it
+		}
+	})
 	txExec(t, tx, "INSERT INTO t VALUES (2)")
-	got := make(chan string, 2)
-	// A reader alone first (a writer queued ahead of it would hide whether
-	// the reader itself is held back).
-	go func() { got <- rows(t, db, "SELECT id FROM t ORDER BY id") }()
-	select {
-	case g := <-got:
-		t.Fatalf("a reader ran while a transaction was writing: %q", g)
-	case <-time.After(100 * time.Millisecond):
+	// Readers run at once and see only committed rows, through the heap
+	// and through the index.
+	for _, q := range []string{"SELECT id FROM t ORDER BY id", "SELECT id FROM t WHERE id >= 1 ORDER BY id"} {
+		read := make(chan string, 1)
+		go func() { read <- rows(t, db, q) }()
+		select {
+		case g := <-read:
+			if g != "1" {
+				t.Fatalf("%s during a writing transaction: %q", q, g)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s waited for a writing transaction", q)
+		}
 	}
+	if g := txRows(t, ro, "SELECT id FROM t ORDER BY id"); g != "1" {
+		t.Fatalf("another transaction during a writing transaction: %q", g)
+	}
+	// The writer itself sees its own row.
+	if g := txRows(t, tx, "SELECT id FROM t ORDER BY id"); g != "1\n2" {
+		t.Fatalf("the writing transaction: %q", g)
+	}
+	inserted := make(chan error, 1)
 	go func() {
-		mustExec(t, db, "INSERT INTO t VALUES (3)")
-		got <- "inserted"
+		_, err := db.Exec(bg, "INSERT INTO t VALUES (3)")
+		inserted <- err
 	}()
 	select {
-	case g := <-got:
-		t.Fatalf("a statement ran while a transaction was writing: %q", g)
+	case err := <-inserted:
+		t.Fatalf("a second writer ran while a transaction was writing: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	// The read-only transaction can still end (it holds nothing).
 	if err := ro.Commit(bg); err != nil {
 		t.Fatal(err)
 	}
+	committed = true
 	if err := tx.Commit(bg); err != nil {
 		t.Fatal(err)
 	}
-	// Both ran after the commit: the reader saw rows 1 and 2, never an
-	// uncommitted state.
-	for range 2 {
-		g := <-got
-		if g != "inserted" && g != "1\n2" && g != "1\n2\n3" {
-			t.Fatalf("%q", g)
-		}
+	if err := <-inserted; err != nil {
+		t.Fatal(err)
 	}
 	if r := rows(t, db, "SELECT id FROM t ORDER BY id"); r != "1\n2\n3" {
 		t.Fatal(r)

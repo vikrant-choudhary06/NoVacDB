@@ -146,28 +146,30 @@ func (t *Txn) begin(ctx context.Context) error {
 		e.stmtMu.Unlock()
 		return fmt.Errorf("beginning a transaction: %w", ErrXIDExhausted)
 	}
+	// The ID is active as soon as it is allocated: a snapshot taken
+	// between the two would see it as committed.
 	e.nextXID++
-	e.mu.Unlock()
-	lsn, err := e.w.Append(ctx, RecordTxnBegin, binary.LittleEndian.AppendUint64(nil, uint64(xid)))
-	if err != nil {
-		// The slot stays taken: the engine must be abandoned (Rollback).
-		t.state, t.xid = txnFailed, xid
-		return fmt.Errorf("beginning a transaction: %w", err)
-	}
-	e.mu.Lock()
 	e.active[xid] = struct{}{}
 	e.lastWriter = xid
 	e.mu.Unlock()
+	lsn, err := e.w.Append(ctx, RecordTxnBegin, binary.LittleEndian.AppendUint64(nil, uint64(xid)))
+	if err != nil {
+		// The slot stays taken and the ID active: the engine must be
+		// abandoned (Rollback).
+		t.state, t.xid = txnFailed, xid
+		return fmt.Errorf("beginning a transaction: %w", err)
+	}
 	t.xid = xid
 	e.horizon.Store(uint64(lsn))
 	return nil
 }
 
 // Commit commits the transaction and returns its commit record's LSN (0 for
-// a transaction that never wrote). It releases the undo no snapshot needs,
-// logs TxnCommit and makes the log
-// durable through it before returning. If that fails, the outcome is
-// unknown until recovery: the caller must abandon the engine.
+// a transaction that never wrote): it logs TxnCommit and makes the log
+// durable through it, then releases the undo no snapshot needs, this
+// transaction's included. If logging fails, the outcome is unknown until
+// recovery; if releasing fails, the transaction has committed (the LSN is
+// returned with the error). Either way the caller must abandon the engine.
 func (t *Txn) Commit(ctx context.Context) (LSN, error) {
 	switch t.state {
 	case txnFailed:
@@ -180,14 +182,7 @@ func (t *Txn) Commit(ctx context.Context) (LSN, error) {
 		return 0, nil
 	}
 	e := t.e
-	// Undo no snapshot needs any more, this transaction's included, is
-	// released inside it, before its commit record
-	// (docs/design/16-snapshots-visibility.md section 2.6).
-	err := e.releaseUndo(ctx, t.xid)
-	var lsn LSN
-	if err == nil {
-		lsn, err = e.w.Append(ctx, RecordTxnCommit, binary.LittleEndian.AppendUint64(nil, uint64(t.xid)))
-	}
+	lsn, err := e.w.Append(ctx, RecordTxnCommit, binary.LittleEndian.AppendUint64(nil, uint64(t.xid)))
 	if err == nil {
 		err = e.w.FlushTo(ctx, lsn)
 	}
@@ -201,6 +196,15 @@ func (t *Txn) Commit(ctx context.Context) (LSN, error) {
 	e.mu.Unlock()
 	t.state = txnCommitted
 	e.horizon.Store(0)
+	// Undo is released only now, still in the writer slot
+	// (docs/design/16-snapshots-visibility.md section 2.6): every snapshot
+	// taken from here on sees this transaction, so only the live ones can
+	// need its undo. Released before the commit record, the segment could
+	// be gone for a snapshot taken before the transaction left the active
+	// set. A crash in between loses nothing: recovery releases all undo.
+	if err := e.releaseUndo(ctx); err != nil {
+		return lsn, fmt.Errorf("transaction %d committed; releasing undo: %w", t.xid, err)
+	}
 	e.stmtMu.Unlock()
 	return lsn, nil
 }

@@ -48,7 +48,7 @@ func TestSnapshotSees(t *testing.T) {
 }
 
 // A transaction still writing never has its undo released, whatever the
-// snapshots: only a committing one's may be.
+// snapshots: only a committed one's may be, by its own commit.
 func TestActiveUndoIsNeverReleased(t *testing.T) {
 	e := mustEngine(t, newFS(t), EngineOptions{Frames: 16})
 	defer func() { _ = e.Abandon() }()
@@ -59,16 +59,35 @@ func TestActiveUndoIsNeverReleased(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.releaseUndo(bg, 0); err != nil {
+	if err := e.releaseUndo(bg); err != nil {
 		t.Fatal(err)
 	}
 	if segs := e.Undo().Segments(); !slices.Equal(segs, []uint64{uint64(tx.XID())}) {
 		t.Fatalf("an active transaction's undo was released: %v", segs)
 	}
-	if err := e.releaseUndo(bg, tx.XID()); err != nil {
+	if _, err := tx.Commit(bg); err != nil {
 		t.Fatal(err)
 	}
 	if segs := e.Undo().Segments(); len(segs) != 0 {
-		t.Fatalf("the committing transaction's undo was kept: %v", segs)
+		t.Fatalf("the committed transaction's undo was kept: %v", segs)
+	}
+}
+
+// A transaction's ID is active from the moment it is allocated: a
+// snapshot taken before its TxnBegin record is logged, here one that
+// failed to be, does not see it.
+func TestBeginningTransactionIsActive(t *testing.T) {
+	e := mustEngine(t, newFS(t), EngineOptions{Frames: 16})
+	defer func() { _ = e.Abandon() }()
+	tx := e.Begin()
+	ctx, cancel := context.WithCancel(bg)
+	cancel()
+	if err := tx.Write(ctx, func(context.Context) error { return nil }); err == nil {
+		t.Fatal("setup: logging TxnBegin with a canceled context succeeded")
+	}
+	s := e.Snapshot()
+	defer s.Release()
+	if tx.XID() == 0 || tx.XID() >= s.XMax || s.Sees(uint64(tx.XID())) || e.LastWriter() != tx.XID() {
+		t.Fatalf("transaction %d, snapshot %+v, last writer %d", tx.XID(), s, e.LastWriter())
 	}
 }

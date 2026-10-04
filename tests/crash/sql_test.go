@@ -9,6 +9,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,6 +45,19 @@ func (m sqlModel) clone() sqlModel {
 
 // String renders the model as dumpSQL renders the database.
 func (m sqlModel) String() string {
+	var b strings.Builder
+	b.WriteString(m.rowsString())
+	for i := range sqlIndexNames {
+		if m.indexes[sqlIndexNames[i]] {
+			b.WriteString("index " + sqlIndexNames[i] + "\n")
+		}
+	}
+	fmt.Fprintf(&b, "extra %d\n", m.extra)
+	return b.String()
+}
+
+// rowsString renders the rows of acct, as a concurrent reader reads them.
+func (m sqlModel) rowsString() string {
 	ids := make([]int, 0, len(m.rows))
 	for id := range m.rows {
 		ids = append(ids, id)
@@ -53,12 +67,6 @@ func (m sqlModel) String() string {
 	for _, id := range ids {
 		fmt.Fprintf(&b, "%d|%d|%s\n", id, m.rows[id].bal, m.rows[id].tag)
 	}
-	for i := range sqlIndexNames {
-		if m.indexes[sqlIndexNames[i]] {
-			b.WriteString("index " + sqlIndexNames[i] + "\n")
-		}
-	}
-	fmt.Fprintf(&b, "extra %d\n", m.extra)
 	return b.String()
 }
 
@@ -239,9 +247,88 @@ func dumpSQL(db *executor.DB) (string, error) {
 	return b.String(), nil
 }
 
+// sqlReader reads acct concurrently with the scenario's statements
+// (docs/design/16-snapshots-visibility.md section 7): each statement, by a
+// table scan or through the primary key, must see a whole committed state,
+// and one reader the states in commit order.
+type sqlReader struct {
+	stop chan struct{}
+	done chan struct{}
+
+	mu    sync.Mutex
+	reads []string
+	err   error
+}
+
+func startSQLReader(db *executor.DB) *sqlReader {
+	r := &sqlReader{stop: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(r.done)
+		for i := 0; ; i++ {
+			select {
+			case <-r.stop:
+				return
+			default:
+			}
+			q := "SELECT id, bal, tag FROM acct ORDER BY id"
+			if i%2 == 1 {
+				q = "SELECT id, bal, tag FROM acct WHERE id >= -1000000000 ORDER BY id"
+			}
+			rs, err := db.Exec(bg, q)
+			if sqlerr.Code(err) == sqlerr.ProgramLimitExceeded {
+				continue // the pool is full of the writer's pages
+			}
+			r.mu.Lock()
+			if err != nil {
+				r.err = fmt.Errorf("%s: %w", q, err)
+				r.mu.Unlock()
+				return
+			}
+			var b strings.Builder
+			for _, row := range rs[0].Rows {
+				fmt.Fprintf(&b, "%d|%d|%s\n", row[0].I, row[1].I, row[2].S)
+			}
+			r.reads = append(r.reads, b.String())
+			r.mu.Unlock()
+		}
+	}()
+	return r
+}
+
+// check stops the reader and checks its reads against states, the
+// possible states of acct in commit order. If wait is false, the reader
+// may be blocked for good, by a transaction left open for the crash that
+// changed the schema (DDL holds the statement lock exclusively): it is
+// left behind, with the abandoned database, and its reads so far are
+// checked.
+func (r *sqlReader) check(states []string, wait bool) (reads int, err error) {
+	close(r.stop)
+	if wait {
+		<-r.done
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return 0, r.err
+	}
+	at := 0
+next:
+	for _, got := range r.reads {
+		for i := at; i < len(states); i++ {
+			if states[i] == got {
+				at = i
+				continue next
+			}
+		}
+		return 0, fmt.Errorf("a concurrent reader read\n%s\nwhich is no committed state at or after\n%s", got, states[at])
+	}
+	return len(r.reads), nil
+}
+
 type sqlScenarioStats struct {
 	statements, ddl, crashes, faultStops, midStatement, keptInFlight, lostInFlight, torn, kills int
 	txCommits, txRollbacks, txOpenAtCrash                                                       int
+	concurrentReads                                                                             int
 }
 
 // runSQLScenario runs one seeded scenario: cycles of random statements and
@@ -298,6 +385,15 @@ func runSQLScenario(t *testing.T, seed uint64) (st sqlScenarioStats) {
 		}
 		candidates := []sqlModel{acked}
 		var openTx *executor.Tx // a transaction left open for the crash
+		// A concurrent reader, in cycles without faults (its I/O would
+		// move the injected faults, which count operations, off the
+		// writer's): states are acct's possible states in commit order.
+		var reader *sqlReader
+		txDDL := false // the last transaction changed the schema
+		states := []string{acked.rowsString()}
+		if !faulted {
+			reader = startSQLReader(db)
+		}
 	units:
 		for range 5 + ctl.IntN(40) {
 			if rng.IntN(4) == 0 {
@@ -307,12 +403,14 @@ func runSQLScenario(t *testing.T, seed uint64) (st sqlScenarioStats) {
 				if err != nil {
 					fail("cycle %d: begin: %v", cycle, err)
 				}
+				txDDL = false
 				after := acked.clone()
 				for range 2 + rng.IntN(4) {
 					s := nextStatement(rng, after, &nextID)
 					st.statements++
 					if s.ddl {
 						st.ddl++
+						txDDL = true
 					}
 					if _, err := tx.Exec(bg, s.sql); err != nil {
 						code := sqlerr.Code(err)
@@ -352,11 +450,13 @@ func runSQLScenario(t *testing.T, seed uint64) (st sqlScenarioStats) {
 						// The commit may or may not have happened.
 						st.faultStops++
 						candidates = []sqlModel{acked, after}
+						states = append(states, after.rowsString())
 						break units
 					}
 					st.txCommits++
 					acked = after
 					candidates = []sqlModel{acked}
+					states = append(states, acked.rowsString())
 				}
 				continue
 			}
@@ -371,6 +471,7 @@ func runSQLScenario(t *testing.T, seed uint64) (st sqlScenarioStats) {
 			if err == nil {
 				acked = after
 				candidates = []sqlModel{acked}
+				states = append(states, acked.rowsString())
 				continue
 			}
 			code := sqlerr.Code(err)
@@ -383,6 +484,7 @@ func runSQLScenario(t *testing.T, seed uint64) (st sqlScenarioStats) {
 			// The statement may or may not have committed.
 			st.faultStops++
 			candidates = []sqlModel{acked, after}
+			states = append(states, after.rowsString())
 			break
 		}
 		// Was the database left mid-statement (its restart failed)? A
@@ -391,6 +493,13 @@ func runSQLScenario(t *testing.T, seed uint64) (st sqlScenarioStats) {
 			if _, err := db.Exec(bg, "SELECT 1"); err != nil {
 				st.midStatement++
 			}
+		}
+		if reader != nil {
+			n, err := reader.check(states, openTx == nil || !txDDL)
+			if err != nil {
+				fail("cycle %d: %v", cycle, err)
+			}
+			st.concurrentReads += n
 		}
 		m.ClearFaults()
 		switch ctl.IntN(4) {
@@ -453,6 +562,7 @@ func TestSQLCrashRecovery(t *testing.T) {
 		total.txCommits += st.txCommits
 		total.txRollbacks += st.txRollbacks
 		total.txOpenAtCrash += st.txOpenAtCrash
+		total.concurrentReads += st.concurrentReads
 	}
 	t.Logf("%d runs: %+v", runs, total)
 	if runs >= 30 {
@@ -461,7 +571,7 @@ func TestSQLCrashRecovery(t *testing.T) {
 			"crashes in the middle of a statement": total.midStatement,
 			"in-flight statements lost":            total.lostInFlight, "torn crashes": total.torn, "process kills": total.kills,
 			"committed transactions": total.txCommits, "rolled-back transactions": total.txRollbacks,
-			"transactions open at a crash": total.txOpenAtCrash,
+			"transactions open at a crash": total.txOpenAtCrash, "concurrent reads": total.concurrentReads,
 		} {
 			if n < runs/10 {
 				t.Errorf("only %d %s in %d runs: the scenario is not exercising enough", n, name, runs)

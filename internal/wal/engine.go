@@ -182,7 +182,7 @@ func (e *Engine) open(ctx context.Context, opts EngineOptions) error {
 	e.rec.UndoSegments = len(e.undo.Segments())
 	// No snapshot survives a restart: every segment left belongs to a
 	// committed transaction nobody can read any more (section 2.6).
-	if err := e.releaseUndo(ctx, 0); err != nil {
+	if err := e.releaseUndo(ctx); err != nil {
 		return fmt.Errorf("recovery: releasing undo: %w", err)
 	}
 	e.ck = NewCheckpointer(e.fsys, e.dir, e.w, e.lg, e.bp, e.dm)
@@ -445,7 +445,7 @@ func (e *Engine) Checkpoint(ctx context.Context) (Control, error) {
 	}
 	e.stmtMu.Lock()
 	defer e.stmtMu.Unlock()
-	if err := e.releaseUndo(ctx, 0); err != nil {
+	if err := e.releaseUndo(ctx); err != nil {
 		return Control{}, fmt.Errorf("checkpoint: releasing undo: %w", err)
 	}
 	ctl, err := e.ck.Checkpoint(ctx)
@@ -479,7 +479,7 @@ func (e *Engine) Close(ctx context.Context) error {
 		// A transaction is writing: closing normally would write its pages.
 		return errors.Join(fmt.Errorf("closing: %w", ErrTxnOpen), e.closeAll())
 	}
-	err := e.releaseUndo(ctx, 0)
+	err := e.releaseUndo(ctx)
 	if err == nil {
 		_, err = e.ck.Checkpoint(ctx)
 	}

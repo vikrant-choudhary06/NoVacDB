@@ -79,7 +79,12 @@ type DB struct {
 	opts Options
 	log  *slog.Logger
 
-	mu       sync.RWMutex // shared for SELECT, exclusive for changes
+	// mu is shared for a statement and exclusive for DDL, Close and
+	// reopening; writer is the writer slot: one writing transaction at a
+	// time. Lock order: writer, then mu
+	// (docs/design/16-snapshots-visibility.md section 2.4).
+	mu       sync.RWMutex
+	writer   sync.Mutex
 	e        *wal.Engine
 	cat      *catalog.Catalog
 	closed   bool
@@ -87,11 +92,13 @@ type DB struct {
 	lastCkpt wal.LSN // the WAL position of the last checkpoint
 
 	// noIndexScans makes every scan sequential (tests compare the two).
-	noIndexScans bool
-	indexScans   atomic.Int64 // scans that used an index
-	rowsRead     atomic.Int64 // rows scans have read, before WHERE
-	restarts     atomic.Int64 // self-restarts after failed statements
-	rollbacks    atomic.Int64 // rollbacks of transactions that wrote
+	noIndexScans     bool
+	indexScanHook    func()       // tests: runs as an index scan begins
+	indexScans       atomic.Int64 // scans that used an index
+	indexScanRetries atomic.Int64 // index scans redone as table scans: a writer began during them
+	rowsRead         atomic.Int64 // rows scans have read, before WHERE
+	restarts         atomic.Int64 // self-restarts after failed statements
+	rollbacks        atomic.Int64 // rollbacks of transactions that wrote
 }
 
 // Open opens the database in dir, creating it if it does not exist, and
@@ -139,6 +146,8 @@ func (db *DB) open(ctx context.Context) error {
 
 // Close checkpoints and closes the database. Statements after Close fail.
 func (db *DB) Close(ctx context.Context) error {
+	db.writer.Lock() // a writing transaction finishes first
+	defer db.writer.Unlock()
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
@@ -181,22 +190,14 @@ func canceled(err error) *sqlerr.Error {
 // parameters' types and result columns: nothing is read or changed, and a
 // statement that is not a query or a row change is not looked at.
 //
-// A statement that may change data takes the lock exclusively; in a
-// transaction it keeps it until the transaction ends (tx.go).
+// Locks (docs/design/16-snapshots-visibility.md section 2.4): every
+// statement holds the lock shared, except DDL, which holds it exclusively;
+// a statement that changes data also takes the writer slot. In a
+// transaction, the writer slot and an exclusive lock are kept until it
+// ends (tx.go).
 func (db *DB) run(ctx context.Context, tx *Tx, sql string, s ast.Stmt, ps *params, describe bool) (*Result, error) {
-	_, isSelect := s.(*ast.Select)
-	switch {
-	case tx != nil && tx.locked:
-	case isSelect || describe:
-		db.mu.RLock()
-		defer db.mu.RUnlock()
-	case tx != nil:
-		db.mu.Lock()
-		tx.locked = true
-	default:
-		db.mu.Lock()
-		defer db.mu.Unlock()
-	}
+	held, ownWriter := db.lock(tx, s, describe)
+	defer db.unlock(held, ownWriter)
 	switch {
 	case db.closed:
 		return nil, sqlerr.New(sqlerr.ObjectNotInPrerequisiteState, "the database is closed")
@@ -213,7 +214,7 @@ func (db *DB) run(ctx context.Context, tx *Tx, sql string, s ast.Stmt, ps *param
 	if tx == nil || tx.isolation != RepeatableRead {
 		defer snap.Release()
 	}
-	st := &stmt{db: db, tx: tx, ctx: ctx, sql: sql, ec: &evalCtx{now: types.TimestampFromTime(db.opts.Now())}, params: ps, describe: describe, snap: snap}
+	st := &stmt{db: db, tx: tx, ctx: ctx, sql: sql, ec: &evalCtx{now: types.TimestampFromTime(db.opts.Now())}, params: ps, describe: describe, snap: snap, held: held}
 	var r *Result
 	switch s.(type) {
 	case *ast.CreateTable, *ast.DropTable, *ast.CreateIndex, *ast.DropIndex:
@@ -285,6 +286,85 @@ type stmt struct {
 	// REPEATABLE READ transaction's (docs/design/16-snapshots-
 	// visibility.md).
 	snap *wal.Snapshot
+	held held // how the statement holds db.mu
+}
+
+// held is how a caller holds db.mu.
+type held int
+
+const (
+	heldNone held = iota
+	heldShared
+	heldExclusive
+	// heldExclusiveByTx: exclusively, kept by the transaction past the
+	// statement.
+	heldExclusiveByTx
+)
+
+func isDDL(s ast.Stmt) bool {
+	switch s.(type) {
+	case *ast.CreateTable, *ast.DropTable, *ast.CreateIndex, *ast.DropIndex:
+		return true
+	}
+	return false
+}
+
+// lock takes the locks a statement needs. It returns how the statement
+// holds db.mu, and whether it took the writer slot for itself alone (an
+// autocommit change), to give back at its end.
+func (db *DB) lock(tx *Tx, s ast.Stmt, describe bool) (h held, ownWriter bool) {
+	_, isSelect := s.(*ast.Select)
+	writes := !isSelect && !describe
+	switch {
+	case writes && tx == nil:
+		db.writer.Lock()
+		ownWriter = true
+	case writes && !tx.writing:
+		db.writer.Lock()
+		tx.writing = true
+	}
+	switch {
+	case tx != nil && tx.locked:
+		return heldExclusiveByTx, ownWriter
+	case writes && isDDL(s) && tx != nil:
+		db.mu.Lock()
+		tx.locked = true
+		return heldExclusiveByTx, ownWriter
+	case writes && isDDL(s):
+		db.mu.Lock()
+		return heldExclusive, ownWriter
+	}
+	db.mu.RLock()
+	return heldShared, ownWriter
+}
+
+// unlock gives back what lock took for the statement alone.
+func (db *DB) unlock(h held, ownWriter bool) {
+	switch h {
+	case heldShared:
+		db.mu.RUnlock()
+	case heldExclusive:
+		db.mu.Unlock()
+	}
+	if ownWriter {
+		db.writer.Unlock()
+	}
+}
+
+// exclusively runs fn holding db.mu exclusively, given how the caller
+// holds it now; the caller holds it the same way afterwards. A writer
+// reopening the engine waits here for running statements.
+func (db *DB) exclusively(h held, fn func()) {
+	switch h {
+	case heldShared:
+		db.mu.RUnlock()
+		db.mu.Lock()
+		defer func() { db.mu.Unlock(); db.mu.RLock() }()
+	case heldNone:
+		db.mu.Lock()
+		defer db.mu.Unlock()
+	}
+	fn()
 }
 
 // snapshot returns the snapshot a statement of tx (nil: autocommit) reads
@@ -331,9 +411,13 @@ func (st *stmt) writer(xid wal.XID, tableID uint64) mvcc.Writer {
 // indexesUsable reports whether the statement may read through indexes:
 // its snapshot sees every transaction that has written, so the indexes,
 // which describe the newest versions, describe what it sees (section 2.5).
-func (st *stmt) indexesUsable() bool {
-	last := uint64(st.db.e.LastWriter())
-	return last == 0 || last == st.me() || st.snap.Sees(last)
+func (st *stmt) indexesUsable() bool { return st.indexesShow(st.db.e.LastWriter()) }
+
+// indexesShow reports whether indexes describe the rows the statement sees
+// when last is the last writer: it is none, the statement's own
+// transaction, or one the snapshot sees.
+func (st *stmt) indexesShow(last wal.XID) bool {
+	return last == 0 || uint64(last) == st.me() || st.snap.Sees(uint64(last))
 }
 
 // binder returns a binder for the statement's expressions that see no
@@ -353,9 +437,8 @@ func (db *DB) tooMuch(err error, inTx bool) *sqlerr.Error {
 
 // apply runs fn, the change phase of a statement, as a write of its
 // transaction: in autocommit it commits it at once, in an explicit
-// transaction the transaction commits later. The caller holds the
-// exclusive lock and has already checked everything that can fail for SQL
-// reasons.
+// transaction the transaction commits later. The caller holds the writer
+// slot and has already checked everything that can fail for SQL reasons.
 //
 // If anything fails once the transaction has begun writing, its changes
 // cannot be undone in memory: the database restarts itself (closing as a
@@ -391,7 +474,7 @@ func (st *stmt) apply(ddl bool, fn func(ctx context.Context, xid wal.XID) error)
 	case ddl && errors.As(err, &se):
 		if st.tx == nil {
 			if _, cerr := wtx.Commit(ctx); cerr != nil {
-				return db.restart(ctx, cerr, false)
+				return db.restart(ctx, cerr, false, st.held)
 			}
 		}
 		return se
@@ -399,7 +482,7 @@ func (st *stmt) apply(ddl bool, fn func(ctx context.Context, xid wal.XID) error)
 		// REPEATABLE READ: the transaction cannot go on; its changes go
 		// as a rollback's do.
 		st.tx.discarded = true
-		if derr := db.discard(ctx, wtx); derr != nil {
+		if derr := db.discard(ctx, wtx, st.held); derr != nil {
 			return derr
 		}
 		return sqlerr.Wrap(err, sqlerr.SerializationFailure, "could not serialize access due to concurrent update").
@@ -408,7 +491,7 @@ func (st *stmt) apply(ddl bool, fn func(ctx context.Context, xid wal.XID) error)
 		if st.tx != nil {
 			st.tx.discarded = true
 		}
-		return db.restart(ctx, err, st.tx != nil)
+		return db.restart(ctx, err, st.tx != nil, st.held)
 	}
 	if st.tx != nil {
 		return nil
@@ -418,7 +501,7 @@ func (st *stmt) apply(ddl bool, fn func(ctx context.Context, xid wal.XID) error)
 	st.snap.Release()
 	lsn, err := wtx.Commit(ctx)
 	if err != nil {
-		return db.restart(ctx, err, false)
+		return db.restart(ctx, err, false, st.held)
 	}
 	db.maybeCheckpoint(ctx, lsn)
 	return nil
@@ -427,11 +510,13 @@ func (st *stmt) apply(ddl bool, fn func(ctx context.Context, xid wal.XID) error)
 // restart abandons the engine and reopens the database after a failed
 // statement or commit, and returns the error for the client. The writing
 // transaction, if any, is discarded by recovery.
-func (db *DB) restart(ctx context.Context, cause error, inTx bool) error {
+func (db *DB) restart(ctx context.Context, cause error, inTx bool, h held) error {
 	db.log.Warn("a change failed; restarting the database", "dir", db.dir, "err", cause)
 	db.restarts.Add(1)
-	_ = db.e.Abandon()
-	db.reopen(ctx)
+	db.exclusively(h, func() {
+		_ = db.e.Abandon()
+		db.reopen(ctx)
+	})
 	if errors.Is(cause, storage.ErrNoFreeFrames) {
 		return db.tooMuch(cause, inTx)
 	}
@@ -441,11 +526,13 @@ func (db *DB) restart(ctx context.Context, cause error, inTx bool) error {
 // discard rolls back a transaction that changed something: the engine is
 // abandoned and the database reopens, and recovery leaves it out (Step 6.1
 // has no undo: docs/design/13-transactions.md section 2.6).
-func (db *DB) discard(ctx context.Context, wtx *wal.Txn) error {
+func (db *DB) discard(ctx context.Context, wtx *wal.Txn, h held) error {
 	db.log.Info("rolling back a transaction: reopening the database", "dir", db.dir, "xid", wtx.XID())
 	db.rollbacks.Add(1)
-	_ = wtx.Rollback(ctx)
-	db.reopen(ctx)
+	db.exclusively(h, func() {
+		_ = wtx.Rollback(ctx)
+		db.reopen(ctx)
+	})
 	if db.broken != nil {
 		return sqlerr.Wrap(db.broken, sqlerr.IOError, "the database is unavailable: reopening it after a rollback failed: %v", db.broken)
 	}
