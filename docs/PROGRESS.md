@@ -282,33 +282,46 @@ Decided on 2026-10-04: the server is made Windows-native only once Phase 6 is co
 
 ## Security (after Phase 6, with or right after Windows support)
 
-Decided on 2026-10-04: every connection must authenticate with a password. Today authentication is "trust" (anyone who can reach the port is in, `12-wire-protocol.md` section 2), which is why the server listens on `localhost` only. These steps replace that before NoVacDB is offered for use beyond one's own machine. Each step has its own design doc, reviewed before any code, and uses only the Go standard library (`crypto/...`).
+Decided on 2026-10-04: security at least as complete as PostgreSQL's, and better where PostgreSQL is weak. Every connection must authenticate with a password. Today authentication is "trust" (anyone who can reach the port is in, `12-wire-protocol.md` section 2), which is why the server listens on `localhost` only. These steps replace that before NoVacDB is offered for use beyond one's own machine. Each step has its own design doc, reviewed before any code, and uses only the Go standard library (`crypto/...`).
+
+**Where NoVacDB aims to be better than PostgreSQL:**
+
+| | PostgreSQL | NoVacDB |
+|---|---|---|
+| Default authentication | Often `trust` in local installs; `md5` still accepted | Password (SCRAM) by default everywhere; no `md5` at all; trust only with an explicit flag, on `localhost` |
+| Brute-force protection | Needs the `auth_delay` extension | Built in (S.1) |
+| Passwords in logs | `CREATE ROLE ... PASSWORD '...'` can reach the server log | Never logged, anywhere (S.1) |
+| Encryption of data on disk | Not in community PostgreSQL | Built in: data file and WAL (S.5) |
+| Audit log | Needs the `pgaudit` extension | Built in (S.6) |
 
 ### ⬜ Step S.1 — Users and password authentication
 
 **Goal:** no connection without a valid user and password.
 
 **Scope:**
-- **SCRAM-SHA-256**, as in PostgreSQL: the password never crosses the network, and the server stores only a salted, iterated hash (never the password itself). `psql`, pgAdmin, drivers and NoVacDB Studio work unchanged.
-- **Users in the catalog:** `CREATE USER name PASSWORD '...'`, `ALTER USER ... PASSWORD`, `DROP USER`. Passwords never appear in logs or error messages.
-- **First start:** the server refuses to start without an initial superuser and password (given once, e.g. `novacdb init --user ...` with the password read from the terminal or a file, never from the command line).
+- **SCRAM-SHA-256**, as in PostgreSQL: the password never crosses the network, and the server stores only a salted, iterated hash. No `md5` or plain-text password methods. `psql`, pgAdmin, drivers and NoVacDB Studio work unchanged.
+- **Users in the catalog:** `CREATE USER name PASSWORD '...'`, `ALTER USER ... PASSWORD`, `DROP USER`, `VALID UNTIL` (password expiry), per-user `CONNECTION LIMIT`.
+- **Passwords never appear in logs, error messages or statement history**: statements that carry a password are redacted before anything records them.
+- **First start:** the server refuses to start without an initial superuser and password (given once, e.g. `novacdb init --user ...`, with the password read from the terminal or a file, never from the command line).
 - **Password is the default everywhere.** Running without passwords ("trust") needs an explicit flag, is allowed only on `localhost`, and logs a warning at every start.
-- **Failed logins:** the same error whether the user exists or not; a delay after repeated failures from one address; every failure logged with its address.
+- **Failed logins:** the same error whether the user exists or not (no user enumeration); a growing delay after repeated failures from one address or for one user; every failure logged with its address.
+- **Access rules by address** (like `pg_hba.conf`): which users may connect from which addresses, and how.
 
-**Acceptance:** wrong password, unknown user and a missing password are all refused with PostgreSQL's error code (`28P01`); the stored hash verifies against PostgreSQL's own SCRAM test vectors; a fuzzed authentication exchange never crashes the server.
+**Acceptance:** wrong password, unknown user, expired password and a missing password are all refused with PostgreSQL's error code (`28P01`) and the same message; the stored hash verifies against PostgreSQL's own SCRAM test vectors; a test greps every log for test passwords and finds none; a fuzzed authentication exchange never crashes the server.
 
 ---
 
-### ⬜ Step S.2 — Encrypted connections (TLS)
+### ⬜ Step S.2 — Encrypted connections (TLS) and certificate login
 
 **Goal:** nobody on the network can read or change what a client and the server exchange.
 
 **Scope:**
 - TLS on the PostgreSQL protocol (the `SSLRequest` that is declined today), with a certificate and key given to the server; `sslmode=require` and `verify-full` work from `psql`.
+- **Client certificate authentication** (as PostgreSQL's `cert` method), optionally together with a password.
 - A setting to refuse connections without TLS from addresses other than `localhost` (the default once a certificate is configured).
-- Only TLS 1.2 and newer; the key file must not be readable by other users, or the server refuses to start.
+- Only TLS 1.2 and newer, with modern cipher suites; the key file must not be readable by other users, or the server refuses to start.
 
-**Acceptance:** connections from `psql`, pgAdmin and Studio with `sslmode=verify-full`; a client asking for no TLS is refused when TLS is required; the handshake is fuzzed.
+**Acceptance:** connections from `psql`, pgAdmin and Studio with `sslmode=verify-full`, and with a client certificate; a client asking for no TLS is refused when TLS is required; the handshake is fuzzed.
 
 ---
 
@@ -317,23 +330,61 @@ Decided on 2026-10-04: every connection must authenticate with a password. Today
 **Goal:** a user can only do what they were allowed to do.
 
 **Scope:**
-- Superuser, and ordinary users who own the tables they create.
-- `GRANT` / `REVOKE` of `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables, and the right to create tables; checked on every statement (`42501` insufficient privilege, as PostgreSQL).
-- Only a superuser manages users.
+- Superuser, and ordinary users who own the objects they create; roles that group users.
+- `GRANT` / `REVOKE` of `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables and **on single columns**, and of the right to create tables; default privileges for new tables. Checked on every statement (`42501` insufficient privilege, as PostgreSQL).
+- Only a superuser manages users; the superuser can be kept off the network (local connections only).
 
 **Acceptance:** a model test of random grants, revokes and statements: every statement is allowed exactly when the model says so.
 
 ---
 
-### ⬜ Step S.4 — Security review and hardening
+### ⬜ Step S.4 — Row-level security
+
+**Goal:** users see and change only the rows a policy allows (for example, each customer only their own orders).
+
+**Scope:**
+- `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, and `CREATE POLICY` with `USING` (which rows are visible) and `WITH CHECK` (which rows may be written), as in PostgreSQL.
+- Policies apply to every access path: scans, index lookups, `UPDATE` and `DELETE`, and are not bypassed by the planner (Phase 7).
+
+**Acceptance:** a model test with random policies and users: no statement reads or writes a row its policy forbids, by any access path.
+
+---
+
+### ⬜ Step S.5 — Encryption at rest (better than PostgreSQL)
+
+**Goal:** someone who copies the data directory or a backup cannot read the data.
+
+**Scope:**
+- Every page of the data file and every WAL record encrypted with AES-256-GCM, which also detects tampering.
+- A key hierarchy: a master key outside the data directory (a file or an environment variable, later a key management service) that encrypts the data keys; changing the master key without rewriting the data.
+- A data format change, which its design doc must justify and the maintainer approve.
+
+**Acceptance:** no plaintext row value appears anywhere in the data directory (test greps the files for known values); a changed byte on disk is reported as corruption, never returned; crash tests pass with encryption on; the cost is measured (Step 6.11 style benchmark).
+
+---
+
+### ⬜ Step S.6 — Audit log (better than PostgreSQL)
+
+**Goal:** a record of who did what, without an extension.
+
+**Scope:**
+- Logins (success and failure, with address), user and privilege changes, schema changes, and optionally data changes per table.
+- Written to its own append-only file, each entry chained to the previous one by a hash so that deleting or editing an entry is detectable.
+- Passwords and, if configured, data values never written to it.
+
+**Acceptance:** every event type appears exactly once per action; a changed or removed entry is detected; the audit log survives crashes like the WAL.
+
+---
+
+### ⬜ Step S.7 — Security review and hardening
 
 **Goal:** close what the earlier steps did not.
 
 **Scope:**
-- Limits that stop one client from taking the server down: connections per user and per address, maximum message and query size, statement timeout.
+- Limits that stop one client from taking the server down: connections per user and per address, maximum message and query size, statement and idle timeouts, memory per query.
 - File permissions: the data directory and its files readable only by the server's user; refuse to start otherwise.
-- A written threat model (`docs/SECURITY.md`): what NoVacDB protects against, what it does not (for example, encryption of data files on disk), and how to report a vulnerability.
-- A full review of the protocol and authentication code, and long fuzzing runs of every message the server reads.
+- A written threat model (`docs/SECURITY.md`): what NoVacDB protects against, what it does not, and how to report a vulnerability.
+- A full review of the protocol, authentication and privilege code, and long fuzzing runs of every message the server reads.
 
 **Acceptance:** the threat model's every claim has a test; fuzzing finds no crash; `SECURITY.md` published.
 
