@@ -256,6 +256,30 @@ flowchart TB
 
 ---
 
+## Windows support (after Phase 6, before Phase 7)
+
+Decided on 2026-10-04: the server is made Windows-native only once Phase 6 is complete, because Phase 6 still changes storage and crash recovery. Until then, run the server on Linux or WSL; Windows clients (NoVacDB Studio, `psql`, pgAdmin) connect to it over `localhost`.
+
+**Today:** the code compiles for Windows (`GOOS=windows go build ./...`), but the file layer (`internal/vfs/osfs.go`) assumes POSIX behaviour, so the server is not expected to run correctly there yet:
+- `SyncDir` fsyncs a directory handle, which Windows does not allow that way;
+- files are renamed or removed while open, which Windows refuses;
+- the durability guarantees (what reaches disk after `Sync`) have only been tested on Linux.
+
+### ⬜ Step W.1 — Windows-native server
+
+**Goal:** `novacdb.exe` runs on Windows with the same crash-safety guarantees as on Linux.
+
+**Scope:**
+- Windows implementation of the file layer (`vfs`): durable directory changes, rename and remove of files that may be open, file locking so two servers cannot open one data directory.
+- Default paths and signals (Ctrl+C, service stop) that make sense on Windows.
+- The whole test suite, the crash tests and a real kill test run on Windows (CI job on a Windows runner).
+- A release build of `novacdb.exe`, and README instructions for Windows (PowerShell and `cmd` commands).
+- Design doc for the file-layer changes, reviewed before any code.
+
+**Acceptance:** `make check` (or its Windows equivalent) passes on Windows; crash and kill tests pass there; a fresh Windows machine can download `novacdb.exe`, start it, and connect with `psql`, pgAdmin and NoVacDB Studio.
+
+---
+
 ## Later phases (detailed when we get there)
 
 - **Phase 7 — Planner:** joins, aggregates, `GROUP BY`, statistics, cost-based plan choice, plan hints
