@@ -8,7 +8,7 @@ This file is the step-by-step build plan. Each step is sized for roughly one foc
 
 ## Current step
 
-👉 **Step 6.5 — Rollback** (next: its design doc, for review before any code)
+👉 **Step 6.5 — Rollback** (design doc `17-rollback.md` written, awaiting review)
 
 ---
 
@@ -157,6 +157,7 @@ flowchart TB
 - Apply a transaction's undo records in reverse order.
 - Statement-level rollback: an error inside a transaction undoes that statement only (the transaction then enters the aborted state, as in PostgreSQL).
 - Rollback steps are WAL-logged (compensation records) so a crash during rollback is safe.
+- Design doc `17-rollback.md`.
 
 **Acceptance:** Random transactions rolled back leave data byte-identical to before; crash during rollback recovers correctly.
 
@@ -172,7 +173,7 @@ flowchart TB
 - `SELECT ... FOR UPDATE`.
 - Lock manager with a wait-for graph and deadlock detection. The error reports exactly which transactions and rows formed the cycle (problem #43).
 - Lock wait timeout setting.
-- Design doc `17-locking.md`.
+- Design doc `18-locking.md`.
 
 **Acceptance:** Concurrency tests for lost updates, waits, timeouts, and deadlocks; deadlock reports are readable and accurate.
 
@@ -187,7 +188,7 @@ flowchart TB
 - Index scans re-check the visible row version against the search key.
 - Unique constraints check against all versions that might still commit, not just visible ones.
 - NULLs in unique indexes behave as in PostgreSQL (multiple NULLs allowed).
-- Design doc update for `08-btree.md` plus `18-mvcc-indexes.md`.
+- Design doc update for `08-btree.md` plus `19-mvcc-indexes.md`.
 
 **Acceptance:** Model-based tests with concurrent snapshots and indexed updates; unique violations raised exactly when PostgreSQL would raise them.
 
@@ -202,7 +203,7 @@ flowchart TB
 - Background purge: discard old undo, remove delete-marked index entries, reclaim space from deleted rows.
 - Purge only touches undo and the specific rows/entries it names. It **never scans whole tables**.
 - Bounded and observable undo retention: report undo size and the oldest transaction holding it back; a configurable limit and warning for long-running transactions (problem #24).
-- Design doc `19-purge.md`.
+- Design doc `20-purge.md`.
 
 **Acceptance:** Under a long random workload with concurrent snapshots, undo size stays bounded, table and index sizes stay flat for update-heavy loads, and no visible version is ever purged too early (model checker).
 

@@ -1,6 +1,6 @@
 # 13 — Transactions (`internal/wal`, `internal/sql/executor`)
 
-Status: **Step 6.1 (transaction manager) designed, approved and implemented** (notes in section 2.8). Later Phase 6 steps extend this document or have their own (14-undo-log.md through 19-purge.md, see PROGRESS.md).
+Status: **Step 6.1 (transaction manager) designed, approved and implemented** (notes in section 2.8). Later Phase 6 steps extend this document or have their own (14-undo-log.md through 20-purge.md, see PROGRESS.md).
 
 ## 1. Problem
 

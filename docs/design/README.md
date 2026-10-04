@@ -25,3 +25,4 @@ Failure & crash, Alternatives, Testing plan, Limitations.
 | [14](14-undo-log.md) | Undo log (`internal/undo`, `internal/wal`) | Step 6.2 implemented |
 | [15](15-row-versioning.md) | Row versioning (`internal/storage`, `internal/mvcc`) | Step 6.3 implemented |
 | [16](16-snapshots-visibility.md) | Snapshots and visibility (`internal/wal`, `internal/mvcc`, `internal/sql/executor`) | Step 6.4 implemented |
+| [17](17-rollback.md) | Rollback (`internal/storage`, `internal/mvcc`, `internal/wal`, `internal/sql/executor`) | Step 6.5 designed, awaiting review |
